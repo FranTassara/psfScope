@@ -54,12 +54,128 @@ For the default system parameters (0.168 µm step, 41° tilt):
 
 import os
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import scipy.ndimage as ndi
 from scipy.optimize import curve_fit
 from skimage.feature import peak_local_max
 from tifffile import imread, imwrite
+
+try:
+    import psfmodels as _psfmodels
+    _HAS_PSFMODELS = True
+except ImportError:
+    _HAS_PSFMODELS = False
+
+
+# =============================================================================
+# Theoretical PSF helpers (require optional dependency: psfmodels)
+# =============================================================================
+
+def _theoretical_psf(shape, dx, dz, wavelength_um, na, ni, model='vectorial'):
+    """
+    Generate a normalised theoretical PSF using psfmodels.
+
+    Parameters
+    ----------
+    shape : tuple (nz, ny, nx)
+        Must match the empirical PSF shape.
+    dx : float  — lateral pixel size [µm]
+    dz : float  — axial voxel size [µm]
+    wavelength_um : float  — emission wavelength [µm]
+    na : float   — objective numerical aperture
+    ni : float   — refractive index of the immersion medium
+    model : {'vectorial', 'scalar'}
+        'vectorial' — vectorial (Richards-Wolf) model.
+        'scalar'    — scalar (Gibson-Lanni) model.
+
+    Returns
+    -------
+    psf_theory : ndarray, float64, shape (nz, ny, nx)
+        Normalised to sum = 1.
+
+    Raises
+    ------
+    ImportError
+        If psfmodels is not installed.  Install with:
+            pip install "psfscope[theory]"
+        or standalone:
+            pip install "psfmodels>=0.3"
+    RuntimeError
+        If the installed psfmodels version has an incompatible API.
+    """
+    if not _HAS_PSFMODELS:
+        raise ImportError(
+            "psfmodels is required for theoretical PSF generation.\n"
+            "Install it with:  pip install \"psfscope[theory]\"\n"
+            "or standalone:    pip install \"psfmodels>=0.3\""
+        )
+
+    nz, ny, nx = shape
+    # psfmodels generates square YX volumes (nx × nx); use the larger dimension
+    # and crop to (ny, nx) afterwards if the ROI is non-square.
+    n_lateral = max(ny, nx)
+
+    fn_name = 'vectorial_psf_centered' if model == 'vectorial' else 'scalar_psf_centered'
+    psf_fn  = getattr(_psfmodels, fn_name, None)
+    if psf_fn is None:
+        installed = getattr(_psfmodels, '__version__', 'unknown')
+        raise RuntimeError(
+            f"psfmodels {installed} does not expose '{fn_name}'. "
+            f"Upgrade to psfmodels>=0.3:  pip install -U psfmodels"
+        )
+
+    psf_t = psf_fn(nz=nz, nx=n_lateral, dxy=dx, dz=dz,
+                   wvl=wavelength_um, na=na, ni=ni)
+
+    # Crop to (nz, ny, nx) when n_lateral exceeds one lateral dimension
+    if n_lateral > ny or n_lateral > nx:
+        cy = (n_lateral - ny) // 2
+        cx = (n_lateral - nx) // 2
+        psf_t = psf_t[:, cy : cy + ny, cx : cx + nx]
+
+    psf_t = np.asarray(psf_t, dtype=np.float64)
+    total = psf_t.sum()
+    if total > 0:
+        psf_t /= total
+    return psf_t
+
+
+def _psf_comparison_metrics(psf_empirical, psf_theoretical):
+    """
+    Compute similarity metrics between two normalised PSFs (sum = 1).
+
+    Parameters
+    ----------
+    psf_empirical, psf_theoretical : ndarray
+        Same shape, both normalised to sum = 1.
+
+    Returns
+    -------
+    dict with:
+        mse       : mean squared error  (lower is better; 0 = perfect)
+        ncc       : normalised cross-correlation at zero lag  (1 = perfect)
+        pearson_r : Pearson correlation coefficient  (1 = perfect)
+    """
+    e = psf_empirical.ravel().astype(float)
+    t = psf_theoretical.ravel().astype(float)
+
+    mse = float(np.mean((e - t) ** 2))
+
+    # NCC: cosine similarity of flattened, normalised intensity vectors
+    norm_e = np.linalg.norm(e)
+    norm_t = np.linalg.norm(t)
+    ncc = float(np.dot(e, t) / (norm_e * norm_t)) if (norm_e > 0 and norm_t > 0) else 0.0
+
+    # Pearson r: linear correlation of intensity distributions
+    e_c   = e - e.mean()
+    t_c   = t - t.mean()
+    denom = np.sqrt(np.dot(e_c, e_c) * np.dot(t_c, t_c))
+    pearson_r = float(np.dot(e_c, t_c) / denom) if denom > 0 else 0.0
+
+    return {'mse': mse, 'ncc': ncc, 'pearson_r': pearson_r}
 
 
 # =============================================================================
@@ -192,6 +308,87 @@ def _quality_check_1d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_o
     return True, sz, sy, sx, offset_px
 
 
+def _radial_symmetry_3d(roi):
+    """
+    Sub-pixel centroid estimation via 3-D radial symmetry.
+
+    Extends the 2-D algorithm of Parthasarathy (2012, doi:10.1038/nmeth.2071)
+    to 3-D by minimising the weighted sum of squared distances from
+    intensity-gradient lines to the estimated centre.  Fully vectorised;
+    no iterative fitting.
+
+    Gradients are estimated at the centres of all unit cubes using the four
+    body diagonals, then combined via a pseudo-inverse to recover (gz, gy, gx).
+    Weights favour large-gradient regions close to the centroid, reducing the
+    influence of distant, low-signal voxels.
+
+    Falls back to the intensity-maximum position on numerical failure (singular
+    matrix or degenerate gradient field).
+
+    Parameters
+    ----------
+    roi : ndarray, shape (nz, ny, nx)
+
+    Returns
+    -------
+    zc, yc, xc : float  — centroid in pixel units
+    """
+    nz, ny, nx = roi.shape
+
+    # Midpoint coordinates (pixel units) of each unit cube centre
+    zm = np.arange(nz - 1, dtype=float) + 0.5
+    ym = np.arange(ny - 1, dtype=float) + 0.5
+    xm = np.arange(nx - 1, dtype=float) + 0.5
+    ZM, YM, XM = np.meshgrid(zm, ym, xm, indexing='ij')   # (nz-1, ny-1, nx-1)
+
+    # Intensity differences along the 4 body diagonals of each unit cube
+    g1 = roi[1:, 1:,  1:]  - roi[:-1, :-1, :-1]   # n ∝ [ 1,  1,  1]
+    g2 = roi[1:, :-1, 1:]  - roi[:-1, 1:,  :-1]   # n ∝ [ 1, -1,  1]
+    g3 = roi[1:, :-1, :-1] - roi[:-1, 1:,  1:]    # n ∝ [ 1, -1, -1]
+    g4 = roi[1:, 1:,  :-1] - roi[:-1, :-1, 1:]    # n ∝ [ 1,  1, -1]
+
+    # Pseudo-inverse maps 4 diagonal measurements → (gz, gy, gx) at each cube
+    N     = np.array([[1,  1,  1],
+                      [1, -1,  1],
+                      [1, -1, -1],
+                      [1,  1, -1]], dtype=float) / np.sqrt(3)  # (4, 3)
+    Npinv = np.linalg.pinv(N)                                   # (3, 4)
+    G     = np.stack([g1.ravel(), g2.ravel(), g3.ravel(), g4.ravel()])  # (4, Nk)
+    gradk = Npinv @ G                                            # (3, Nk)
+
+    # Weights: large gradient magnitude, small distance to centroid
+    grad_norm_sq = np.einsum('ik,ik->k', gradk, gradk)          # (Nk,)
+    grad_norm    = np.sqrt(grad_norm_sq)
+
+    coords_flat = np.stack([ZM.ravel(), YM.ravel(), XM.ravel()])       # (3, Nk)
+    centroid_gn = ((coords_flat * grad_norm).sum(axis=1)
+                   / (grad_norm.sum() + 1e-12))                         # (3,)
+    diff        = coords_flat - centroid_gn[:, None]
+    dk          = np.sqrt(np.einsum('ik,ik->k', diff, diff))           # (Nk,)
+    wk          = grad_norm_sq / (dk + 1e-6)
+
+    # Normalised gradient directions, guarded against near-zero norms
+    nk = gradk / (grad_norm + 1e-12)                                    # (3, Nk)
+
+    # 3×3 linear system  M @ [zc, yc, xc]ᵀ = b
+    # M_ij = Σk wk (δij − nki nkj)
+    # b_i  = Σk wk (Pk_i − nki (nk · Pk))
+    M         = wk.sum() * np.eye(3) - np.einsum('k,ik,jk->ij', wk, nk, nk)
+    dot_nk_Pk = np.einsum('ik,ik->k', nk, coords_flat)
+    b         = (np.einsum('k,ik->i',    wk, coords_flat)
+                 - np.einsum('k,ik,k->i', wk, nk, dot_nk_Pk))
+
+    try:
+        zc, yc, xc = np.linalg.solve(M, b)
+    except np.linalg.LinAlgError:
+        iz, iy, ix = np.unravel_index(np.argmax(roi), roi.shape)
+        return float(iz), float(iy), float(ix)
+
+    return (float(np.clip(zc, 0, nz - 1)),
+            float(np.clip(yc, 0, ny - 1)),
+            float(np.clip(xc, 0, nx - 1)))
+
+
 def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px):
     """
     Assess bead quality via a simultaneous 3-D Gaussian fit.
@@ -199,9 +396,10 @@ def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_o
     Fits  I(z,y,x) = A·exp(-((z-cz)²/2σz² + (y-cy)²/2σy² + (x-cx)²/2σx²)) + bg
     to the entire ROI volume in physical-unit (µm) coordinates.
 
-    Initial parameter guesses are derived from the intensity-peak position and
-    the empirical half-maximum width of each 1-D profile, providing a good
-    starting point while keeping the optimisation tractable.
+    Initial parameter guesses use _radial_symmetry_3d for the centre (cz, cy, cx)
+    — sub-pixel accuracy without iteration — and the empirical half-maximum width
+    of each 1-D profile for the sigmas.  Better starting points reduce the number
+    of Gaussian-fit iterations, particularly for off-axis beads.
 
     Returns
     -------
@@ -221,7 +419,12 @@ def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_o
     if A0 <= 0:
         return False, None, None, None, None
 
-    cz0, cy0, cx0 = z_coords[iz], y_coords[iy], x_coords[ix]
+    # Sub-pixel centroid via radial symmetry: better p0 for (cz, cy, cx) than
+    # integer-resolution argmax, with no additional iterative fitting.
+    iz_rs, iy_rs, ix_rs = _radial_symmetry_3d(roi)
+    cz0 = iz_rs * dz
+    cy0 = iy_rs * dx
+    cx0 = ix_rs * dx
 
     def _s0(coords, profile):
         half  = bg0 + 0.5 * A0
@@ -345,6 +548,71 @@ def _center_and_average(rois, offsets):
     return np.nanmean(aligned, axis=0)
 
 
+def _process_one_bead(cz, cy, cx, volume, nz, ny, nx, rz, ry, rx,
+                       dx, dz, sigma_xy_bounds, sigma_z_bounds,
+                       max_center_offset_px, fit_mode):
+    """
+    Process one bead candidate: border check, ROI extraction, quality filter,
+    and SNR computation.
+
+    Designed to be called from both a sequential loop and a
+    ThreadPoolExecutor.  ``volume`` is accessed read-only; NumPy slicing is
+    thread-safe, and SciPy/NumPy routines release the GIL so multiple threads
+    can run their Gaussian fits concurrently.
+
+    Returns
+    -------
+    dict with key ``status`` in {'border', 'rejected', 'accepted'} plus
+    per-bead data for accepted beads (roi, sz, sy, sx, offset_px, snr).
+    """
+    # Border check
+    if (cz < rz or cz + rz + 1 > nz or
+            cy < ry or cy + ry + 1 > ny or
+            cx < rx or cx + rx + 1 > nx):
+        return {'status': 'border', 'pos': (int(cz), int(cy), int(cx))}
+
+    roi = volume[
+        cz - rz : cz + rz + 1,
+        cy - ry : cy + ry + 1,
+        cx - rx : cx + rx + 1,
+    ].astype(np.float32)
+
+    # Local background subtraction (5th percentile of the ROI)
+    roi -= np.percentile(roi, 5)
+    roi  = np.clip(roi, 0, None)
+
+    if fit_mode == '3d':
+        ok, sz, sy, sx, offset_px = _quality_check_3d(
+            roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px
+        )
+    else:
+        ok, sz, sy, sx, offset_px = _quality_check_1d(
+            roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px
+        )
+
+    if not ok:
+        return {'status': 'rejected', 'pos': (int(cz), int(cy), int(cx))}
+
+    # SNR: peak signal / std of the ROI outer shell (background noise estimate)
+    outer_shell = np.concatenate([
+        roi[0].ravel(), roi[-1].ravel(),
+        roi[:, 0, :].ravel(), roi[:, -1, :].ravel(),
+        roi[:, :, 0].ravel(), roi[:, :, -1].ravel(),
+    ])
+    snr = float(np.max(roi)) / max(float(np.std(outer_shell)), 1e-6)
+
+    return {
+        'status':    'accepted',
+        'pos':       (int(cz), int(cy), int(cx)),
+        'roi':       roi,
+        'sz':        sz,
+        'sy':        sy,
+        'sx':        sx,
+        'offset_px': offset_px,
+        'snr':       snr,
+    }
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -367,6 +635,12 @@ def estimate_psf_from_beads(
     progress_callback=None,
     return_bead_data=False,
     fit_mode='1d',
+    n_jobs=1,
+    compare_theoretical=False,
+    na=None,
+    wavelength_um=None,
+    ni=1.333,
+    psf_model='vectorial',
 ):
     """
     Estimate the experimental PSF by averaging isolated sub-diffraction beads.
@@ -419,6 +693,30 @@ def estimate_psf_from_beads(
              Fast and robust for beads with a roughly symmetric PSF.
         '3d' — simultaneous 3-D Gaussian fit to the full ROI volume.
              More accurate for asymmetric PSFs but ~10–100× slower per bead.
+    n_jobs : int
+        Number of parallel worker threads for the bead quality-check loop.
+        1 (default) — sequential, zero threading overhead.
+        -1           — use all logical CPU cores (os.cpu_count()).
+        N > 1        — use exactly N threads.
+        Threads share the volume array without copying.  SciPy and NumPy
+        release the GIL during their C extensions, so speedup is real on
+        multi-core machines.  Most useful when fit_mode='3d'.
+    compare_theoretical : bool
+        If True, generate a theoretical PSF with psfmodels and compute
+        similarity metrics against the empirical PSF.  Requires psfmodels
+        (pip install "psfscope[theory]") and the na/wavelength_um parameters.
+    na : float or None
+        Objective numerical aperture.  Required when compare_theoretical=True.
+    wavelength_um : float or None
+        Fluorophore emission wavelength [µm] (e.g. 0.515 for 515 nm).
+        Required when compare_theoretical=True.
+    ni : float
+        Refractive index of the immersion medium (default 1.333, water).
+        Used only when compare_theoretical=True.
+    psf_model : {'vectorial', 'scalar'}
+        Theoretical PSF model to use via psfmodels.
+        'vectorial' (default) — Richards-Wolf vectorial model.
+        'scalar'              — Gibson-Lanni scalar model.
 
     Returns
     -------
@@ -449,6 +747,10 @@ def estimate_psf_from_beads(
         n_quality_rejected  candidates rejected by the quality filter
         n_accepted          beads that passed quality (len of accepted_* arrays)
         n_used              beads included in the final average
+        psf_theoretical     normalised theoretical PSF, shape (Nz, Ny, Nx), or None
+        psf_mse             mean squared error vs theoretical PSF, or None
+        psf_ncc             normalised cross-correlation vs theoretical PSF, or None
+        psf_pearson_r       Pearson r vs theoretical PSF, or None
     """
     def _cb(frac, msg):
         if progress_callback is not None:
@@ -533,65 +835,69 @@ def estimate_psf_from_beads(
     rejected_list    = []
     n_border, n_quality = 0, 0
 
-    n_cand = len(candidates)
-    for i, (cz, cy, cx) in enumerate(candidates):
-        # Update progress every ~5% of candidates
-        if i % max(1, n_cand // 20) == 0:
-            _cb(0.20 + 0.60 * i / max(n_cand, 1),
-                f"Checking bead {i+1}/{n_cand} ...")
+    n_cand   = len(candidates)
+    n_workers = (os.cpu_count() or 1) if n_jobs == -1 else max(1, n_jobs)
 
-        # Reject candidates whose ROI extends beyond the volume boundary
-        if (cz < rz or cz + rz + 1 > nz or
-                cy < ry or cy + ry + 1 > ny or
-                cx < rx or cx + rx + 1 > nx):
+    # Closure that binds all per-run constants; only (cz, cy, cx) varies.
+    # volume is read-only → thread-safe for concurrent NumPy slicing.
+    def _worker(czyx):
+        cz, cy, cx = int(czyx[0]), int(czyx[1]), int(czyx[2])
+        return _process_one_bead(
+            cz, cy, cx, volume, nz, ny, nx, rz, ry, rx,
+            dx, dz, sigma_xy_bounds, sigma_z_bounds,
+            max_center_offset_px, fit_mode,
+        )
+
+    if n_workers == 1:
+        # Sequential path: per-bead progress updates, zero threading overhead.
+        raw_results = []
+        for i, czyx in enumerate(candidates):
+            if i % max(1, n_cand // 20) == 0:
+                _cb(0.20 + 0.60 * i / max(n_cand, 1),
+                    f"Checking bead {i+1}/{n_cand} ...")
+            raw_results.append(_worker(czyx))
+    else:
+        # Parallel path: ThreadPoolExecutor shares volume without copying.
+        # SciPy/NumPy release the GIL, enabling real multi-core throughput.
+        _done = [0]
+        _lock = threading.Lock()
+
+        def _worker_tracked(czyx):
+            result = _worker(czyx)
+            with _lock:
+                _done[0] += 1
+                d = _done[0]
+            if d % max(1, n_cand // 20) == 0 or d == n_cand:
+                _cb(0.20 + 0.60 * d / max(n_cand, 1),
+                    f"Checked {d}/{n_cand} candidates ...")
+            return result
+
+        if verbose:
+            print(f"[PSF] Parallel bead processing: {n_workers} threads")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            raw_results = list(executor.map(_worker_tracked, candidates))
+
+    # Unpack results — order preserved by both sequential and parallel paths.
+    for r in raw_results:
+        if r['status'] == 'border':
             n_border += 1
-            border_list.append((int(cz), int(cy), int(cx)))
-            continue
-
-        roi = volume[
-            cz - rz : cz + rz + 1,
-            cy - ry : cy + ry + 1,
-            cx - rx : cx + rx + 1,
-        ].astype(np.float32)
-
-        # Local background subtraction (5th percentile of the ROI)
-        roi -= np.percentile(roi, 5)
-        roi  = np.clip(roi, 0, None)
-
-        if fit_mode == '3d':
-            ok, sz, sy, sx, offset_px = _quality_check_3d(
-                roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px
-            )
-        else:
-            ok, sz, sy, sx, offset_px = _quality_check_1d(
-                roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px
-            )
-        if not ok:
+            border_list.append(r['pos'])
+        elif r['status'] == 'rejected':
             n_quality += 1
-            rejected_list.append((int(cz), int(cy), int(cx)))
-            continue
-
-        # SNR: peak signal (bg already subtracted) / std of the ROI outer shell
-        # The outer shell (first/last slice along each axis) is far from the bead
-        # centre and serves as a local background noise estimate.
-        outer_shell = np.concatenate([
-            roi[0].ravel(), roi[-1].ravel(),
-            roi[:, 0, :].ravel(), roi[:, -1, :].ravel(),
-            roi[:, :, 0].ravel(), roi[:, :, -1].ravel(),
-        ])
-        noise = float(np.std(outer_shell))
-        snr   = float(np.max(roi)) / max(noise, 1e-6)
-
-        valid_rois.append(roi)
-        offsets_list.append(offset_px)
-        all_sigma_z.append(sz)
-        all_sigma_y.append(sy)
-        all_sigma_x.append(sx)
-        sxy_mean = (sy + sx) / 2.0
-        all_sigma_xy.append(sxy_mean)
-        all_ellipticity.append((sx - sy) / sxy_mean if sxy_mean > 0 else 0.0)
-        all_snr.append(snr)
-        all_accepted_pos.append((int(cz), int(cy), int(cx)))
+            rejected_list.append(r['pos'])
+        else:  # accepted
+            roi      = r['roi']
+            sz, sy, sx = r['sz'], r['sy'], r['sx']
+            sxy_mean = (sy + sx) / 2.0
+            valid_rois.append(roi)
+            offsets_list.append(r['offset_px'])
+            all_sigma_z.append(sz)
+            all_sigma_y.append(sy)
+            all_sigma_x.append(sx)
+            all_sigma_xy.append(sxy_mean)
+            all_ellipticity.append((sx - sy) / sxy_mean if sxy_mean > 0 else 0.0)
+            all_snr.append(r['snr'])
+            all_accepted_pos.append(r['pos'])
 
     if verbose:
         print(f"[PSF] Rejected (border):  {n_border}")
@@ -667,6 +973,32 @@ def estimate_psf_from_beads(
     psf = np.nan_to_num(psf, nan=0.0).astype(np.float32)
     _cb(0.95, "PSF normalised")
 
+    # --- Theoretical PSF comparison (optional, requires psfmodels) ---
+    if compare_theoretical:
+        if na is None or wavelength_um is None:
+            raise ValueError(
+                "compare_theoretical=True requires 'na' and 'wavelength_um' to be specified."
+            )
+        try:
+            psf_theory = _theoretical_psf(
+                psf.shape, dx, dz, wavelength_um, na, ni, psf_model
+            )
+            metrics = _psf_comparison_metrics(psf.astype(float), psf_theory)
+            if verbose:
+                print(f"[PSF] Theory vs empirical  (model: {psf_model}):")
+                print(f"[PSF]   MSE       = {metrics['mse']:.6f}")
+                print(f"[PSF]   NCC       = {metrics['ncc']:.4f}")
+                print(f"[PSF]   Pearson r = {metrics['pearson_r']:.4f}")
+            _cb(0.97, f"Theory comparison: NCC={metrics['ncc']:.3f}  MSE={metrics['mse']:.2e}")
+        except Exception as exc:
+            if verbose:
+                print(f"[PSF] Warning: theoretical PSF comparison failed: {exc}")
+            psf_theory = None
+            metrics    = {'mse': None, 'ncc': None, 'pearson_r': None}
+    else:
+        psf_theory = None
+        metrics    = {'mse': None, 'ncc': None, 'pearson_r': None}
+
     # --- Save ---
     if save_path is None:
         base      = os.path.splitext(tif_path)[0]
@@ -704,6 +1036,10 @@ def estimate_psf_from_beads(
         'n_quality_rejected': n_quality,
         'n_accepted':         len(all_accepted_pos),
         'n_used':             int(used_mask.sum()),
+        'psf_theoretical':    psf_theory,
+        'psf_mse':            metrics['mse'],
+        'psf_ncc':            metrics['ncc'],
+        'psf_pearson_r':      metrics['pearson_r'],
     }
     return psf, save_path, bead_data
 
@@ -748,6 +1084,22 @@ def _parse_args():
     p.add_argument("--fit-mode",      type=str, default="1d",
                    choices=["1d", "3d"],
                    help="Fitting mode: '1d' (fast, sequential) or '3d' (accurate, slow)")
+    p.add_argument("--n-jobs",        type=int, default=1,
+                   help="Worker threads for the bead loop. "
+                        "1 = sequential; -1 = all CPU cores. "
+                        "Most useful with --fit-mode 3d.")
+    p.add_argument("--compare-theoretical", action="store_true",
+                   help="Compare empirical PSF to a theoretical model (requires psfmodels).")
+    p.add_argument("--na",            type=float, default=None,
+                   help="Numerical aperture (required with --compare-theoretical).")
+    p.add_argument("--wavelength",    type=float, default=None,
+                   help="Emission wavelength in µm (required with --compare-theoretical).")
+    p.add_argument("--ni",            type=float, default=1.333,
+                   help="Immersion medium refractive index.")
+    p.add_argument("--psf-model",     type=str,   default="vectorial",
+                   choices=["vectorial", "scalar"],
+                   help="Theoretical PSF model (vectorial = Richards-Wolf; "
+                        "scalar = Gibson-Lanni).")
     return p.parse_args()
 
 
@@ -759,16 +1111,22 @@ if __name__ == "__main__":
     else:
         args = _parse_args()
         estimate_psf_from_beads(
-            tif_path         = args.input,
-            dx               = args.dx,
-            dz               = args.dz,
-            threshold        = args.threshold,
-            min_sep_um       = args.min_sep,
-            roi_um           = tuple(args.roi_um),
-            sigma_xy_bounds  = tuple(args.sigma_xy),
-            sigma_z_bounds   = tuple(args.sigma_z),
-            best_fraction    = args.best_fraction,
-            save_path        = args.output,
-            fit_mode         = args.fit_mode,
-            verbose          = True,
+            tif_path             = args.input,
+            dx                   = args.dx,
+            dz                   = args.dz,
+            threshold            = args.threshold,
+            min_sep_um           = args.min_sep,
+            roi_um               = tuple(args.roi_um),
+            sigma_xy_bounds      = tuple(args.sigma_xy),
+            sigma_z_bounds       = tuple(args.sigma_z),
+            best_fraction        = args.best_fraction,
+            save_path            = args.output,
+            fit_mode             = args.fit_mode,
+            n_jobs               = args.n_jobs,
+            compare_theoretical  = args.compare_theoretical,
+            na                   = args.na,
+            wavelength_um        = args.wavelength,
+            ni                   = args.ni,
+            psf_model            = args.psf_model,
+            verbose              = True,
         )

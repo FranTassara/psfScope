@@ -47,6 +47,9 @@ dev = [
     "pytest>=7",
     "pytest-cov",
 ]
+theory = [
+    "psfmodels>=0.3",
+]
 
 [project.scripts]
 psfscope = "psf_gui:launch_gui"
