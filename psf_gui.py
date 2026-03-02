@@ -908,6 +908,9 @@ class PSFScopeGUI:
             return
         # Don't fire while the toolbar is in pan/zoom mode
         if hasattr(self, 'beads_toolbar') and self.beads_toolbar.mode != '':
+            self.status_var.set(
+                "Deactivate the zoom/pan tool (toolbar) to use click-to-inspect."
+            )
             return
 
         bd = self._bead_data
@@ -997,6 +1000,10 @@ class PSFScopeGUI:
         win.resizable(True, True)
         win.columnconfigure(0, weight=1)
         win.rowconfigure(0, weight=1)
+        # Ensure the popup appears in front of the main window (needed on Windows)
+        win.transient(self.root)
+        win.lift()
+        win.focus_force()
 
         fig = Figure(figsize=(11, 7), tight_layout=True)
 
