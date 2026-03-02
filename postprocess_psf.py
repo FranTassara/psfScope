@@ -246,12 +246,34 @@ def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_o
               (x - cx) ** 2 / (2 * sx ** 2))
         ) + bg)
 
+    def _gauss3d_jac(coords, A, cz, cy, cx, sz, sy, sx, bg):  # noqa: ARG001 — bg unused: ∂I/∂bg = 1
+        # Analytical Jacobian of _gauss3d w.r.t. [A, cz, cy, cx, sz, sy, sx, bg].
+        # Computing G once and reusing it avoids 8 redundant exp() calls per
+        # iteration compared to numerical finite-difference approximation.
+        z, y, x = coords
+        ez = (z - cz) ** 2 / (2 * sz ** 2)
+        ey = (y - cy) ** 2 / (2 * sy ** 2)
+        ex = (x - cx) ** 2 / (2 * sx ** 2)
+        G  = np.exp(-(ez + ey + ex))
+        AG = A * G
+        J       = np.empty((len(z), 8))
+        J[:, 0] = G                               # ∂/∂A
+        J[:, 1] = AG * (z - cz) / sz ** 2        # ∂/∂cz
+        J[:, 2] = AG * (y - cy) / sy ** 2        # ∂/∂cy
+        J[:, 3] = AG * (x - cx) / sx ** 2        # ∂/∂cx
+        J[:, 4] = AG * (z - cz) ** 2 / sz ** 3  # ∂/∂sz
+        J[:, 5] = AG * (y - cy) ** 2 / sy ** 3  # ∂/∂sy
+        J[:, 6] = AG * (x - cx) ** 2 / sx ** 3  # ∂/∂sx
+        J[:, 7] = 1.0                             # ∂/∂bg
+        return J
+
     try:
         popt, _ = curve_fit(
             _gauss3d,
             coords_flat,
             data_flat,
             p0=[A0, cz0, cy0, cx0, sz0, sy0, sx0, bg0],
+            jac=_gauss3d_jac,
             bounds=(
                 [0,      z_coords[0],  y_coords[0],  x_coords[0],  1e-6, 1e-6, 1e-6, 0      ],
                 [np.inf, z_coords[-1], y_coords[-1], x_coords[-1], np.inf, np.inf, np.inf, np.inf],
