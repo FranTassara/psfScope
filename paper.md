@@ -89,19 +89,27 @@ map of PSF spatial variability across the microscope field of view.
    ellipticity, and SNR as a function of sample-plane position. A dedicated
    FWHM-versus-depth scatter plot reveals depth-dependent spherical aberration
    that is invisible to tools reporting only a single aggregate PSF.
-4. **Theoretical PSF overlay**: an optional Born-Wolf theoretical PSF
+4. **Theoretical PSF comparison**: `psfScope` provides two complementary levels
+   of theoretical reference. In the GUI, Born-Wolf analytical FWHMs
    (FWHM_xy = 0.51 · λ / NA, FWHM_z = 0.887 · λ / (n − √(n² − NA²)))
-   can be overlaid on all measurement plots, providing an immediate visual
-   reference for how much the experimental PSF deviates from the diffraction
-   limit.
+   are overlaid on all measurement plots as a quick visual benchmark.
+   At the programmatic level, the `compare_theoretical` option calls the
+   `psfmodels` package [@psfmodels] to generate a full vectorial (Richards-Wolf)
+   or scalar (Gibson-Lanni [@gibson_lanni_1992]) PSF on the same voxel grid
+   as the empirical PSF. Three quantitative similarity metrics are then reported:
+   mean squared error (MSE), normalised cross-correlation (NCC), and Pearson
+   correlation coefficient, enabling objective assessment of how closely the
+   experimental PSF matches diffraction theory.
 5. **Interactive bead inspector**: clicking any bead in the spatial scatter
    plot opens a per-bead Toplevel window showing the three ROI cross-sections
    and 1-D intensity profiles with Gaussian fit overlays, together with all
    fitted parameters, enabling rapid visual quality control.
 6. **Zero-overhead installation**: the GUI uses Python's built-in `tkinter`
-   module; the only non-standard dependencies are `numpy`, `scipy`,
-   `scikit-image`, `tifffile`, and `matplotlib` — all part of the standard
-   scientific Python stack.
+   module; the core dependencies are `numpy`, `scipy`, `scikit-image`,
+   `tifffile`, and `matplotlib` — all part of the standard scientific Python
+   stack. The optional `psfmodels` package (installable as
+   `pip install psfscope[theory]`) is only required for quantitative
+   theoretical PSF comparison and is not needed for routine use.
 7. **Pipeline integration**: the core function `estimate_psf_from_beads`
    returns a normalised 3-D array (sum = 1) compatible with the
    Richardson–Lucy deconvolution implementation in the accompanying
@@ -112,7 +120,7 @@ map of PSF spatial variability across the microscope field of view.
 ## Algorithm
 
 The PSF estimation pipeline operates on a deskewed ZYX volume of
-sub-diffraction fluorescent beads and proceeds in seven steps
+sub-diffraction fluorescent beads and proceeds in eight steps
 (Figure 1).
 
 **Step 1 — Anisotropic band-pass filtering.**
@@ -151,10 +159,15 @@ within their ROI.
 entire ROI volume by minimising the residual sum of squares over all voxels.
 The 8-parameter model
 I(z, y, x) = A · exp(−((z−c_z)²/2σ_z² + (y−c_y)²/2σ_y² + (x−c_x)²/2σ_x²)) + bg
-is initialised from the 1-D empirical half-maximum widths and optimised with
-`scipy.optimize.curve_fit`. The same sigma-bounds and centre-offset checks are
-applied. This mode captures PSF asymmetries that sequential 1-D fits may miss,
-at the cost of approximately 10–100× longer processing time per bead.
+is initialised with sigma values from the 1-D empirical half-maximum widths and
+centroid coordinates (c_z₀, c_y₀, c_x₀) from the radial symmetry algorithm of
+@parthasarathy_2012, which provides sub-pixel accuracy without iterative fitting.
+The optimisation is performed with `scipy.optimize.curve_fit` [@scipy] and
+accelerated by supplying an analytical Jacobian of the 3-D Gaussian model,
+reducing the number of function evaluations required for convergence. The same
+sigma-bounds and centre-offset checks are applied as in 1-D mode. This mode
+captures PSF asymmetries that sequential 1-D fits may miss, at the cost of
+approximately 10–100× longer processing time per bead.
 
 **Step 4b — SNR estimation.**
 For each accepted bead, the signal-to-noise ratio is computed as the ratio of
@@ -164,6 +177,17 @@ axis. These border voxels are far from the bead centre and sample the local
 background noise. The SNR is stored as a per-bead attribute and exported in
 the CSV table and FOV map, allowing beads acquired under low-signal conditions
 to be identified and optionally excluded from downstream analysis.
+
+**Step 4c — Parallel processing.**
+The per-bead loop (Steps 3–4b) can be parallelised across multiple CPU threads
+via the `n_jobs` parameter of `estimate_psf_from_beads`. Each bead is processed
+as an independent task using Python's standard `concurrent.futures.ThreadPoolExecutor`.
+Because the computationally intensive operations — NumPy array manipulations and
+SciPy optimisation — release the Global Interpreter Lock (GIL), genuine
+multi-core speedup is achieved without additional dependencies. The default
+`n_jobs=1` preserves sequential behaviour for backward compatibility. Parallel
+execution is particularly beneficial in 3-D fitting mode, where per-bead
+processing time is dominated by the iterative Gaussian optimisation.
 
 **Step 5 — Best-fraction selection.**
 The accepted beads are ranked by their mean lateral sigma (σ_xy = (σ_y + σ_x) / 2).
@@ -182,6 +206,20 @@ values are excluded from the average without introducing a zero-padding bias.
 The averaged PSF is normalised to unit sum and saved as a 32-bit floating-point
 TIFF with ImageJ-compatible metadata. It can be loaded directly by deconvolution
 software that accepts a sampled PSF kernel.
+
+**Step 8 — Theoretical PSF comparison (optional).**
+When `compare_theoretical=True`, `psfmodels` [@psfmodels] is called to generate
+a theoretical PSF on the same ZYX voxel grid, using the user-supplied numerical
+aperture, emission wavelength, and immersion refractive index. Both vectorial
+(Richards-Wolf) and scalar (Gibson-Lanni) models are supported. The theoretical
+volume is normalised to unit sum and compared to the empirical PSF by computing
+three metrics: (i) mean squared error (MSE), measuring pixel-wise intensity
+deviation; (ii) normalised cross-correlation (NCC), equivalent to the cosine
+similarity of the two flattened intensity vectors and invariant to global scaling;
+and (iii) Pearson correlation coefficient, which captures linear association
+independently of mean and variance. All three metrics, together with the
+theoretical PSF array itself, are returned in the `bead_data` dictionary for
+downstream analysis or visualisation.
 
 ## Graphical User Interface
 
@@ -240,8 +278,10 @@ The package includes a test suite that generates synthetic 3-D bead volumes
 - the returned PSF is float32, non-negative, and has unit sum;
 - at least one valid bead is detected from a volume containing well-separated
   synthetic beads;
-- `bead_data` contains all expected keys — including `accepted_snr` and
-  `accepted_ellipticity` — with consistent array shapes;
+- `bead_data` contains all expected keys — including `accepted_snr`,
+  `accepted_ellipticity`, and the theoretical comparison keys
+  (`psf_theoretical`, `psf_mse`, `psf_ncc`, `psf_pearson_r`) — with
+  consistent array shapes and `None` values when `compare_theoretical=False`;
 - the estimated sigma values are within 30% of the ground truth;
 - the `progress_callback` is called with fractions in [0, 1] ending at 1.0;
 - the function returns `(psf, save_path)` when `return_bead_data=False`
