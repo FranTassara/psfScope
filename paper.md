@@ -12,18 +12,18 @@ tags:
   - fluorescence imaging
 
 authors:
-  - name: [Francisco Joaquin Tassara]
+  - name: Francisco Joaquin Tassara
     orcid: 0000-0000-0000-0000
     affiliation: 1
-  - name: [Julian Gargiulo]
+  - name: Julian Gargiulo
     orcid: 0000-0000-0000-0000
     affiliation: 1
 
 affiliations:
-  - name: [INSTITUTION], [COUNTRY]
+  - name: INSTITUTION, COUNTRY
     index: 1
 
-date: [DATE]
+date: 11 March 2026
 bibliography: paper.bib
 ---
 
