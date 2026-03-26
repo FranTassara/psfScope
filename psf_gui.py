@@ -827,7 +827,7 @@ class PSFScopeGUI:
             vol_id     = bd['volume_id']
             vol_paths  = bd.get('volume_paths', [])
             cmap_vols  = matplotlib.cm.tab10
-            vol_colors = [cmap_vols(i % 10) for i in range(n_vols)]
+            vol_colors = [cmap_vols(i % 10 / 10) for i in range(n_vols)]
 
             for vid in range(n_vols):
                 vol_mask = vol_id == vid
@@ -927,7 +927,7 @@ class PSFScopeGUI:
                 u_vol  = np.where( used & vol_mask)[0]
                 if len(nu_vol):
                     self.hist_ax3.scatter(bead_z[nu_vol], fwhm_xy[nu_vol],
-                                          color=col, s=18, alpha=0.45, marker="o",
+                                          s=18, alpha=0.45, marker="o",
                                           facecolors="none", edgecolors=col)
                 if len(u_vol):
                     vol_name = (os.path.basename(bd['volume_paths'][vid])
