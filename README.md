@@ -27,7 +27,7 @@ pip install psfscope
 Or from source:
 
 ```bash
-git clone https://github.com/[ORG]/psfScope.git
+git clone https://github.com/FranTassara/psfScope.git
 cd psfScope
 pip install -e .
 ```
