@@ -248,6 +248,10 @@ class PSFScopeGUI:
                                   command=self._run)
         self.run_btn.pack(side="left", padx=8)
 
+        self.clear_btn = ttk.Button(ctrl, text="✕  Clear",
+                                    command=self._clear_results, state="disabled")
+        self.clear_btn.pack(side="left", padx=4)
+
         self.progress = ttk.Progressbar(ctrl, length=380, mode="determinate",
                                         maximum=100)
         self.progress.pack(side="left", padx=8)
@@ -444,7 +448,8 @@ class PSFScopeGUI:
             old_stdout = sys.stdout
             sys.stdout = _StdoutRedirector(self._log_append)
             try:
-                n = len(tif_files)
+                n       = len(tif_files)
+                results = []
                 for i, tif in enumerate(tif_files):
                     frac_base  = i / n
                     frac_scale = 1.0 / n
@@ -453,7 +458,7 @@ class PSFScopeGUI:
                         self._queue.put(("progress", _b + f * _s, msg))
 
                     save = outp if (outp and n == 1) else None
-                    result = estimate_psf_from_beads(
+                    psf, save_path, bead_data = estimate_psf_from_beads(
                         tif_path          = tif,
                         dx                = dx,
                         dz                = dz,
@@ -467,9 +472,18 @@ class PSFScopeGUI:
                         progress_callback = _cb,
                         return_bead_data  = True,
                     )
-                    psf, save_path, bead_data = result
+                    results.append((psf, bead_data, save_path))
 
-                self._queue.put(("done", psf, bead_data, save_path, tif))
+                if n == 1:
+                    psf, bead_data, save_path = results[0]
+                    last_tif = tif_files[0]
+                else:
+                    psf       = PSFScopeGUI._merge_psfs(results)
+                    bead_data = PSFScopeGUI._merge_bead_data(results, tif_files)
+                    save_path = f"{n} volumes merged"
+                    last_tif  = None   # inspector requires a single source file
+
+                self._queue.put(("done", psf, bead_data, save_path, last_tif))
             except Exception:
                 import traceback
                 self._queue.put(("error", traceback.format_exc()))
@@ -501,6 +515,7 @@ class PSFScopeGUI:
                     self.pct_lbl.config(text="100%")
                     self.status_var.set(f"✓  {save_path}")
                     self.run_btn.config(state="normal")
+                    self.clear_btn.config(state="normal")
                     self._update_all_plots()
                     return
 
@@ -514,6 +529,162 @@ class PSFScopeGUI:
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
+
+    # =========================================================================
+    # Clear / reset
+    # =========================================================================
+
+    def _clear_results(self):
+        """Reset the application to its initial state without closing the window.
+
+        Clears all result plots and internal state variables, but leaves all
+        input parameters (file paths, pixel sizes, thresholds, etc.) intact so
+        the user can re-run with adjusted settings immediately.
+        """
+        # --- State variables ---
+        self._psf           = None
+        self._bead_data     = None
+        self._fov_cbar      = None
+        self._last_tif_path = None
+
+        # --- Progress bar, labels, log, status ---
+        self.progress["value"] = 0
+        self.pct_lbl.config(text="")
+        self._clear_log()
+        self.status_var.set("Ready.")
+        self.psf_fwhm_var.set("")
+        self.psf_theory_var.set("")
+        self.beads_stats_var.set("")
+
+        # --- PSF cross-sections tab ---
+        for ax, title in zip(
+            [self.ax_xy, self.ax_xz, self.ax_yz],
+            ["XY  (focal plane)",
+             "XZ  (axial · lateral X)",
+             "YZ  (axial · lateral Y)"],
+        ):
+            ax.cla()
+            ax.set_title(title, fontsize=9)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, color="gray", fontsize=10)
+        self.psf_canvas.draw()
+
+        # --- Beads scatter tab ---
+        self.beads_fig.clear()
+        self.beads_ax = self.beads_fig.add_subplot(111)
+        self.beads_ax.set_title("Bead positions (XY projection)", fontsize=9)
+        self.beads_ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                           transform=self.beads_ax.transAxes, color="gray")
+        self.beads_canvas.draw()
+
+        # --- FWHM histograms ---
+        for ax, title in zip(
+            [self.hist_ax1, self.hist_ax2, self.hist_ax3],
+            ["FWHM_xy", "FWHM_z", "FWHM vs bead Z position"],
+        ):
+            ax.cla()
+            ax.set_title(title, fontsize=9)
+        self.hist_canvas.draw()
+
+        # --- FOV map tab ---
+        self.fov_fig.clear()
+        self.fov_ax = self.fov_fig.add_subplot(111)
+        self.fov_ax.set_title("PSF variation across the field of view", fontsize=10)
+        self.fov_ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                         transform=self.fov_ax.transAxes, color="gray")
+        self.fov_canvas.draw()
+
+        # Disable until the next successful run
+        self.clear_btn.config(state="disabled")
+
+    # =========================================================================
+    # Batch merge helpers
+    # =========================================================================
+
+    @staticmethod
+    def _merge_psfs(results):
+        """Weighted average of per-volume PSFs, weighted by n_used beads.
+
+        Each PSF_i is already a nanmean of its n_used_i aligned ROIs,
+        normalized to sum=1.  Weighting by n_used_i before averaging is
+        mathematically equivalent to computing the nanmean over every bead
+        across all volumes simultaneously, which is what the backend would
+        produce if all beads came from a single file.
+        """
+        weights = np.array([bd['n_used'] for _, bd, _ in results], dtype=np.float64)
+        if weights.sum() == 0:
+            weights = np.ones(len(results), dtype=np.float64)
+
+        psf_stack = np.stack([psf.astype(np.float64) for psf, _, _ in results], axis=0)
+        combined  = np.einsum('i,ixyz->xyz', weights, psf_stack) / weights.sum()
+
+        # Re-apply the same normalization the backend uses (min-subtract, sum=1)
+        combined -= combined.min()
+        s = combined.sum()
+        if s > 0:
+            combined /= s
+        return combined.astype(np.float32)
+
+    @staticmethod
+    def _merge_bead_data(results, tif_files):
+        """Concatenate per-volume bead_data dicts into one aggregated dict.
+
+        A ``volume_id`` array (int32) is added to every accepted-bead row so
+        that scatter plots can colour beads by their source volume.
+        ``volume_paths`` preserves the ordered list of source file paths.
+        """
+        def _vstack_px(arrays):
+            """Concatenate (N, 3) pixel arrays, handling empty-list edge cases."""
+            nonempty = [a for a in arrays if len(a) > 0]
+            if not nonempty:
+                return np.zeros((0, 3), dtype=np.int32)
+            return np.concatenate(nonempty, axis=0)
+
+        bd0 = results[0][1]
+
+        # Warn once if pixel sizes differ across volumes
+        for _, bd, _ in results[1:]:
+            if abs(bd['dx'] - bd0['dx']) > 1e-6 or abs(bd['dz'] - bd0['dz']) > 1e-6:
+                import warnings
+                warnings.warn(
+                    "Batch volumes have different pixel sizes; "
+                    "using dx/dz from the first volume for display."
+                )
+                break
+
+        # volume_id: one entry per accepted bead
+        vol_id_arrays = [
+            np.full(bd['n_accepted'], vid, dtype=np.int32)
+            for vid, (_, bd, _) in enumerate(results)
+        ]
+
+        return {
+            'dx':        bd0['dx'],
+            'dz':        bd0['dz'],
+            'roi_shape': bd0['roi_shape'],
+            # Per-bead arrays (accepted)
+            'accepted_px':          _vstack_px([r[1]['accepted_px']          for r in results]),
+            'accepted_sigma_z':     np.concatenate([r[1]['accepted_sigma_z']     for r in results]),
+            'accepted_sigma_y':     np.concatenate([r[1]['accepted_sigma_y']     for r in results]),
+            'accepted_sigma_x':     np.concatenate([r[1]['accepted_sigma_x']     for r in results]),
+            'accepted_sigma_xy':    np.concatenate([r[1]['accepted_sigma_xy']    for r in results]),
+            'accepted_ellipticity': np.concatenate([r[1]['accepted_ellipticity'] for r in results]),
+            'accepted_snr':         np.concatenate([r[1]['accepted_snr']         for r in results]),
+            'accepted_used':        np.concatenate([r[1]['accepted_used']        for r in results]),
+            'volume_id':            np.concatenate(vol_id_arrays),
+            # Rejected / border arrays
+            'border_px':   _vstack_px([r[1]['border_px']   for r in results]),
+            'rejected_px': _vstack_px([r[1]['rejected_px'] for r in results]),
+            # Summed counts
+            'n_total':            sum(r[1]['n_total']            for r in results),
+            'n_border':           sum(r[1]['n_border']           for r in results),
+            'n_quality_rejected': sum(r[1]['n_quality_rejected'] for r in results),
+            'n_accepted':         sum(r[1]['n_accepted']         for r in results),
+            'n_used':             sum(r[1]['n_used']             for r in results),
+            # Batch metadata
+            'volume_paths': list(tif_files),
+            'n_volumes':    len(results),
+        }
 
     # =========================================================================
     # Plot updates
@@ -646,33 +817,70 @@ class PSFScopeGUI:
         used    = bd['accepted_used']
         sxy_all = bd['accepted_sigma_xy']
 
-        # Accepted but not used in final PSF (steel blue ○)
+        is_batch  = 'volume_id' in bd
         not_used_idx = np.where(~used)[0]
-        if len(not_used_idx):
-            nup = acc_px[not_used_idx]
-            self.beads_ax.scatter(nup[:, 2] * dx, nup[:, 1] * dx,
-                                  marker="o", s=28, color="steelblue", alpha=0.55,
-                                  label=f"Accepted, not used ({len(not_used_idx)})",
-                                  zorder=3)
+        used_idx     = np.where( used)[0]
 
-        # Beads used in final PSF (coloured by σ_xy)
-        used_idx = np.where(used)[0]
-        if len(used_idx):
-            up = acc_px[used_idx]
-            us = sxy_all[used_idx] * 1000   # nm
-            sc = self.beads_ax.scatter(up[:, 2] * dx, up[:, 1] * dx,
-                                       c=us, cmap="viridis_r",
-                                       vmin=us.min(), vmax=us.max(),
-                                       marker="o", s=60,
-                                       edgecolors="black", lw=0.4,
-                                       label=f"Used in PSF ({len(used_idx)})",
-                                       zorder=5)
-            self.beads_fig.colorbar(sc, ax=self.beads_ax,
-                                    label="σ_xy (nm)", shrink=0.85)
+        if is_batch:
+            # ── Batch mode: colour accepted beads by source volume ────────────
+            n_vols     = bd['n_volumes']
+            vol_id     = bd['volume_id']
+            vol_paths  = bd.get('volume_paths', [])
+            cmap_vols  = matplotlib.cm.tab10
+            vol_colors = [cmap_vols(i % 10) for i in range(n_vols)]
+
+            for vid in range(n_vols):
+                vol_mask = vol_id == vid
+                col      = vol_colors[vid]
+                vol_name = os.path.basename(vol_paths[vid]) if vid < len(vol_paths) else f"Vol {vid}"
+
+                nu_vol = np.where(~used & vol_mask)[0]
+                u_vol  = np.where( used & vol_mask)[0]
+
+                if len(nu_vol):
+                    nup = acc_px[nu_vol]
+                    self.beads_ax.scatter(nup[:, 2] * dx, nup[:, 1] * dx,
+                                          marker="o", s=22,
+                                          facecolors="none", edgecolors=col,
+                                          linewidths=0.9, alpha=0.7,
+                                          zorder=3)
+                if len(u_vol):
+                    up = acc_px[u_vol]
+                    self.beads_ax.scatter(up[:, 2] * dx, up[:, 1] * dx,
+                                          marker="o", s=55, color=col,
+                                          edgecolors="black", lw=0.4, alpha=0.85,
+                                          label=f"{vol_name} ({len(u_vol)} used)",
+                                          zorder=5)
+
+            scatter_title = (f"Bead positions — {n_vols} volumes  "
+                             f"(colour = volume,  ○ outline = not used)")
+        else:
+            # ── Single file: colour used beads by σ_xy ────────────────────────
+            if len(not_used_idx):
+                nup = acc_px[not_used_idx]
+                self.beads_ax.scatter(nup[:, 2] * dx, nup[:, 1] * dx,
+                                      marker="o", s=28, color="steelblue", alpha=0.55,
+                                      label=f"Accepted, not used ({len(not_used_idx)})",
+                                      zorder=3)
+
+            if len(used_idx):
+                up = acc_px[used_idx]
+                us = sxy_all[used_idx] * 1000   # nm
+                sc = self.beads_ax.scatter(up[:, 2] * dx, up[:, 1] * dx,
+                                           c=us, cmap="viridis_r",
+                                           vmin=us.min(), vmax=us.max(),
+                                           marker="o", s=60,
+                                           edgecolors="black", lw=0.4,
+                                           label=f"Used in PSF ({len(used_idx)})",
+                                           zorder=5)
+                self.beads_fig.colorbar(sc, ax=self.beads_ax,
+                                        label="σ_xy (nm)", shrink=0.85)
+
+            scatter_title = "Bead positions (XY projection)"
 
         self.beads_ax.set_xlabel("x (µm)", fontsize=9)
         self.beads_ax.set_ylabel("y (µm)", fontsize=9)
-        self.beads_ax.set_title("Bead positions (XY projection)", fontsize=10)
+        self.beads_ax.set_title(scatter_title, fontsize=10)
         self.beads_ax.legend(fontsize=7, loc="upper right")
         self.beads_ax.set_aspect("equal")
 
@@ -711,12 +919,29 @@ class PSFScopeGUI:
             ax.legend(fontsize=7)
 
         # FWHM vs bead Z position (detects depth-dependent aberrations)
-        if len(not_used_idx):
-            self.hist_ax3.scatter(bead_z[not_used_idx], fwhm_xy[not_used_idx],
-                                  c="steelblue", s=22, alpha=0.55, label="Not used")
-        if len(used_idx):
-            self.hist_ax3.scatter(bead_z[used_idx], fwhm_xy[used_idx],
-                                  c="green", s=30, alpha=0.8, label="Used")
+        if is_batch:
+            for vid in range(bd['n_volumes']):
+                vol_mask = bd['volume_id'] == vid
+                col      = vol_colors[vid]
+                nu_vol = np.where(~used & vol_mask)[0]
+                u_vol  = np.where( used & vol_mask)[0]
+                if len(nu_vol):
+                    self.hist_ax3.scatter(bead_z[nu_vol], fwhm_xy[nu_vol],
+                                          color=col, s=18, alpha=0.45, marker="o",
+                                          facecolors="none", edgecolors=col)
+                if len(u_vol):
+                    vol_name = (os.path.basename(bd['volume_paths'][vid])
+                                if vid < len(bd.get('volume_paths', [])) else f"Vol {vid}")
+                    self.hist_ax3.scatter(bead_z[u_vol], fwhm_xy[u_vol],
+                                          color=col, s=28, alpha=0.8,
+                                          label=vol_name)
+        else:
+            if len(not_used_idx):
+                self.hist_ax3.scatter(bead_z[not_used_idx], fwhm_xy[not_used_idx],
+                                      c="steelblue", s=22, alpha=0.55, label="Not used")
+            if len(used_idx):
+                self.hist_ax3.scatter(bead_z[used_idx], fwhm_xy[used_idx],
+                                      c="green", s=30, alpha=0.8, label="Used")
         if theory:
             fxy_t, _ = theory
             self.hist_ax3.axhline(fxy_t, color="darkorange", lw=1.5, ls="--",
@@ -728,7 +953,9 @@ class PSFScopeGUI:
 
         # Summary statistics
         n_used = len(used_idx)
-        stats = (f"Total candidates: {bd['n_total']}  |  "
+        vol_prefix = f"Volumes: {bd['n_volumes']}  |  " if is_batch else ""
+        stats = (f"{vol_prefix}"
+                 f"Total candidates: {bd['n_total']}  |  "
                  f"Border: {bd['n_border']}  |  "
                  f"Quality rejected: {bd['n_quality_rejected']}  |  "
                  f"Accepted: {bd['n_accepted']}  |  "
