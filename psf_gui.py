@@ -259,10 +259,23 @@ class PSFScopeGUI:
         self.pct_lbl = ttk.Label(ctrl, text="", width=5)
         self.pct_lbl.pack(side="left")
 
+        self.save_res_btn = ttk.Button(ctrl, text="Save results …",
+                                       command=self._save_results, state="disabled")
+        self.save_res_btn.pack(side="right", padx=4)
+
+        self.load_res_btn = ttk.Button(ctrl, text="Load results …",
+                                       command=self._load_results)
+        self.load_res_btn.pack(side="right", padx=4)
+
         # --- Log ---
         lf = ttk.LabelFrame(parent, text="Log")
         lf.grid(row=4, column=0, sticky="nsew", **PAD)
         parent.rowconfigure(4, weight=1)
+
+        log_toolbar = ttk.Frame(lf)
+        log_toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Button(log_toolbar, text="Save log …",
+                   command=self._save_log).pack(side="right")
 
         self.log = ScrolledText(lf, height=12, state="disabled",
                                 font=("Consolas", 9), wrap="word")
@@ -448,8 +461,9 @@ class PSFScopeGUI:
             old_stdout = sys.stdout
             sys.stdout = _StdoutRedirector(self._log_append)
             try:
-                n       = len(tif_files)
-                results = []
+                n            = len(tif_files)
+                results      = []
+                ok_tif_files = []
                 for i, tif in enumerate(tif_files):
                     frac_base  = i / n
                     frac_scale = 1.0 / n
@@ -458,29 +472,45 @@ class PSFScopeGUI:
                         self._queue.put(("progress", _b + f * _s, msg))
 
                     save = outp if (outp and n == 1) else None
-                    psf, save_path, bead_data = estimate_psf_from_beads(
-                        tif_path          = tif,
-                        dx                = dx,
-                        dz                = dz,
-                        threshold         = thr,
-                        min_sep_um        = sep,
-                        roi_um            = roi,
-                        best_fraction     = frac,
-                        save_path         = save,
-                        fit_mode          = fit_mode,
-                        verbose           = True,
-                        progress_callback = _cb,
-                        return_bead_data  = True,
+                    try:
+                        psf, save_path, bead_data = estimate_psf_from_beads(
+                            tif_path          = tif,
+                            dx                = dx,
+                            dz                = dz,
+                            threshold         = thr,
+                            min_sep_um        = sep,
+                            roi_um            = roi,
+                            best_fraction     = frac,
+                            save_path         = save,
+                            fit_mode          = fit_mode,
+                            verbose           = True,
+                            progress_callback = _cb,
+                            return_bead_data  = True,
+                        )
+                        results.append((psf, bead_data, save_path))
+                        ok_tif_files.append(tif)
+                    except Exception as exc:
+                        import traceback as _tb
+                        print(f"\n⚠ Skipping {os.path.basename(tif)}: {exc}\n"
+                              f"{_tb.format_exc()}")
+
+                if not results:
+                    raise RuntimeError(
+                        "All volumes failed — no valid beads found in any file."
                     )
-                    results.append((psf, bead_data, save_path))
 
                 if n == 1:
                     psf, bead_data, save_path = results[0]
                     last_tif = tif_files[0]
                 else:
                     psf       = PSFScopeGUI._merge_psfs(results)
-                    bead_data = PSFScopeGUI._merge_bead_data(results, tif_files)
-                    save_path = f"{n} volumes merged"
+                    bead_data = PSFScopeGUI._merge_bead_data(results, ok_tif_files)
+                    n_ok      = len(ok_tif_files)
+                    skipped   = n - n_ok
+                    save_path = (
+                        f"{n_ok} volumes merged"
+                        + (f"  ({skipped} skipped)" if skipped else "")
+                    )
                     last_tif  = None   # inspector requires a single source file
 
                 self._queue.put(("done", psf, bead_data, save_path, last_tif))
@@ -516,6 +546,7 @@ class PSFScopeGUI:
                     self.status_var.set(f"✓  {save_path}")
                     self.run_btn.config(state="normal")
                     self.clear_btn.config(state="normal")
+                    self.save_res_btn.config(state="normal")
                     self._update_all_plots()
                     return
 
@@ -529,6 +560,91 @@ class PSFScopeGUI:
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
+
+    # =========================================================================
+    # Log / Results I/O
+    # =========================================================================
+
+    def _save_log(self):
+        path = filedialog.asksaveasfilename(
+            title="Save log as …",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        text = self.log.get("1.0", "end-1c")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.status_var.set(f"Log saved → {os.path.basename(path)}")
+
+    def _save_results(self):
+        """Serialize PSF array + bead_data dict to a compressed .psfr file."""
+        if self._psf is None or self._bead_data is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save results as …",
+            defaultextension=".psfr.npz",
+            filetypes=[("PSF results", "*.psfr.npz"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        arrays = {"psf": self._psf}
+        for key, val in self._bead_data.items():
+            if key == "volume_paths":
+                arrays["bd_volume_paths"] = np.array([str(p) for p in val])
+            elif key == "roi_shape":
+                arrays["bd_roi_shape"] = np.array(list(val), dtype=np.int64)
+            elif isinstance(val, np.ndarray):
+                arrays[f"bd_{key}"] = val
+            else:
+                arrays[f"bd_{key}"] = np.array(val)
+        np.savez_compressed(path, **arrays)
+        self.status_var.set(f"Results saved → {os.path.basename(path)}")
+
+    def _load_results(self):
+        """Load a .psfr file and restore PSF + bead_data, then refresh all plots."""
+        path = filedialog.askopenfilename(
+            title="Load results …",
+            filetypes=[("PSF results", "*.psfr.npz"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = np.load(path, allow_pickle=False)
+        except Exception as exc:
+            messagebox.showerror("Load error", str(exc))
+            return
+
+        if "psf" not in data.files:
+            messagebox.showerror("Load error", "File does not contain a PSF array.")
+            return
+
+        self._psf = data["psf"]
+
+        bd = {}
+        for raw_key in data.files:
+            if not raw_key.startswith("bd_"):
+                continue
+            field = raw_key[3:]          # strip "bd_" prefix
+            arr   = data[raw_key]
+            if field == "volume_paths":
+                bd[field] = list(arr.astype(str))
+            elif field == "roi_shape":
+                bd[field] = tuple(arr.tolist())
+            elif arr.ndim == 0:
+                bd[field] = arr.item()
+            else:
+                bd[field] = arr
+        self._bead_data     = bd
+        self._last_tif_path = None
+
+        self._clear_log()
+        self._log_append(f"[Loaded from {os.path.basename(path)}]\n")
+        self.clear_btn.config(state="normal")
+        self.save_res_btn.config(state="normal")
+        self._update_all_plots()
+        self.status_var.set(f"Loaded: {os.path.basename(path)}")
 
     # =========================================================================
     # Clear / reset
@@ -596,6 +712,7 @@ class PSFScopeGUI:
 
         # Disable until the next successful run
         self.clear_btn.config(state="disabled")
+        self.save_res_btn.config(state="disabled")
 
     # =========================================================================
     # Batch merge helpers
