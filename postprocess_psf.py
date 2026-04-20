@@ -952,14 +952,18 @@ def estimate_psf_from_beads(
         sy_mean  = np.mean(sigma_y_list)
         sx_mean  = np.mean(sigma_x_list)
         sxy_mean = np.mean(sigma_xy_list)
-        print(f"[PSF] σ_z  : {sz_mean:.3f} ± {np.std(sigma_z_list):.3f} µm"
-              f"  →  FWHM_z  ≈ {sz_mean*2.355*1000:.0f} ± {np.std(sigma_z_list)*2.355*1000:.0f} nm")
-        print(f"[PSF] σ_y  : {sy_mean:.3f} ± {np.std(sigma_y_list):.3f} µm"
-              f"  →  FWHM_y  ≈ {sy_mean*2.355*1000:.0f} ± {np.std(sigma_y_list)*2.355*1000:.0f} nm")
-        print(f"[PSF] σ_x  : {sx_mean:.3f} ± {np.std(sigma_x_list):.3f} µm"
-              f"  →  FWHM_x  ≈ {sx_mean*2.355*1000:.0f} ± {np.std(sigma_x_list)*2.355*1000:.0f} nm")
-        print(f"[PSF] σ_xy : {sxy_mean:.3f} ± {np.std(sigma_xy_list):.3f} µm"
-              f"  →  FWHM_xy ≈ {sxy_mean*2.355*1000:.0f} ± {np.std(sigma_xy_list)*2.355*1000:.0f} nm")
+        n_beads  = len(sigma_z_list)
+        sqn      = np.sqrt(n_beads)
+        sz_sd  = np.std(sigma_z_list);  sz_sem  = sz_sd  / sqn
+        sy_sd  = np.std(sigma_y_list);  sy_sem  = sy_sd  / sqn
+        sx_sd  = np.std(sigma_x_list);  sx_sem  = sx_sd  / sqn
+        sxy_sd = np.std(sigma_xy_list); sxy_sem = sxy_sd / sqn
+        k = 2.355 * 1000  # σ → FWHM in nm
+        print(f"[PSF] N = {n_beads} beads")
+        print(f"[PSF] σ_z  : {sz_mean:.3f} ± {sz_sd:.3f} µm (SD)  →  FWHM_z  ≈ {sz_mean*k:.0f} ± {sz_sd*k:.0f} nm (SD,  SEM={sz_sem*k:.0f} nm)")
+        print(f"[PSF] σ_y  : {sy_mean:.3f} ± {sy_sd:.3f} µm (SD)  →  FWHM_y  ≈ {sy_mean*k:.0f} ± {sy_sd*k:.0f} nm (SD,  SEM={sy_sem*k:.0f} nm)")
+        print(f"[PSF] σ_x  : {sx_mean:.3f} ± {sx_sd:.3f} µm (SD)  →  FWHM_x  ≈ {sx_mean*k:.0f} ± {sx_sd*k:.0f} nm (SD,  SEM={sx_sem*k:.0f} nm)")
+        print(f"[PSF] σ_xy : {sxy_mean:.3f} ± {sxy_sd:.3f} µm (SD)  →  FWHM_xy ≈ {sxy_mean*k:.0f} ± {sxy_sd*k:.0f} nm (SD,  SEM={sxy_sem*k:.0f} nm)")
 
     # --- Sub-pixel alignment and averaging ---
     _cb(0.88, "Averaging beads ...")
