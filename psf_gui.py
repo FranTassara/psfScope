@@ -318,6 +318,10 @@ class PSFScopeGUI:
                   font=("Consolas", 9), foreground="#b84800").grid(
             row=3, column=0, sticky="w", padx=10, pady=2)
 
+        ttk.Button(parent, text="⬇  Save projections as TIFF",
+                   command=self._save_psf_projections).grid(
+            row=4, column=0, sticky="w", padx=10, pady=6)
+
     # =========================================================================
     # Tab 3: Detected beads
     # =========================================================================
@@ -867,6 +871,65 @@ class PSFScopeGUI:
 
         self.psf_fig.tight_layout()
         self.psf_canvas.draw()
+
+    def _save_psf_projections(self):
+        if self._psf is None:
+            messagebox.showwarning("No data", "Run PSF estimation first.")
+            return
+        from tifffile import imwrite as _imwrite
+        from scipy.ndimage import zoom as _zoom
+        psf = self._psf
+        nz, ny, nx = psf.shape
+        cz, cy, cx = nz // 2, ny // 2, nx // 2
+
+        try:
+            dx = float(self.dx_var.get())
+            dz = float(self.dz_var.get())
+        except ValueError:
+            dx = dz = 1.0
+
+        base = filedialog.asksaveasfilename(
+            title="Save projections — choose base name (suffix _XY/XZ/YZ added)",
+            defaultextension=".tif",
+            filetypes=[("TIFF files", "*.tif *.tiff")],
+        )
+        if not base:
+            return
+
+        root, ext = os.path.splitext(base)
+        if ext.lower() not in (".tif", ".tiff"):
+            ext = ".tif"
+
+        def _to_uint16(arr):
+            a = arr.astype(np.float32)
+            mn, mx = a.min(), a.max()
+            if mx > mn:
+                a = (a - mn) / (mx - mn)
+            return (a * 65535).astype(np.uint16)
+
+        # XZ and YZ: resample z-axis so every pixel = dx µm (isotropic)
+        z_factor = dz / dx
+        xy_slice = psf[cz]
+        xz_slice = _zoom(psf[:, cy, :], zoom=(z_factor, 1.0), order=3)
+        yz_slice = _zoom(psf[:, :, cx], zoom=(z_factor, 1.0), order=3)
+
+        # ImageJ-compatible metadata: resolution in pixels-per-µm
+        res = (1.0 / dx, 1.0 / dx)   # isotropic after zoom
+        ij_meta = {"unit": "um"}
+
+        projections = {
+            "XY": xy_slice,
+            "XZ": xz_slice,
+            "YZ": yz_slice,
+        }
+        saved = []
+        for label, arr in projections.items():
+            path = f"{root}_{label}{ext}"
+            _imwrite(path, _to_uint16(arr),
+                     imagej=True, resolution=res, metadata=ij_meta)
+            saved.append(os.path.basename(path))
+
+        messagebox.showinfo("Saved", "Projections saved:\n" + "\n".join(saved))
 
     def _compute_fwhm_str(self, psf, dx, dz):
         """Fit 1-D Gaussians to the PSF centre profiles and return a FWHM string."""
