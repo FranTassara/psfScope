@@ -31,7 +31,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from scipy.optimize import curve_fit
 
-from postprocess_psf import estimate_psf_from_beads
+from postprocess_psf import estimate_psf_from_beads, measure_fwhm_from_averaged_psf
 
 PAD = {"padx": 8, "pady": 4}
 
@@ -90,6 +90,11 @@ class PSFScopeGUI:
         f4 = ttk.Frame(self.nb)
         self.nb.add(f4, text="  FOV Map  ")
         self._build_fov_tab(f4)
+
+        # Tab 5: FWHM diagnostics
+        f5 = ttk.Frame(self.nb)
+        self.nb.add(f5, text="  FWHM diagnostics  ")
+        self._build_hist_fit_tab(f5)
 
         # Global status bar
         self.status_var = tk.StringVar(value="Ready.")
@@ -167,54 +172,71 @@ class PSFScopeGUI:
         pf = ttk.LabelFrame(param_row, text="Parameters")
         pf.grid(row=0, column=0, sticky="nsew", **PAD)
 
-        self.dx_var    = tk.StringVar(value="0.127")
-        self.dz_var    = tk.StringVar(value="0.110")
-        self.thr_var   = tk.StringVar(value="")
-        self.frac_var  = tk.StringVar(value="0.5")
-        self.sep_var   = tk.StringVar(value="2.0")
-        self.roi_z_var = tk.StringVar(value="2.5")
-        self.roi_y_var = tk.StringVar(value="2.5")
-        self.roi_x_var = tk.StringVar(value="2.5")
+        self.dx_var            = tk.StringVar(value="0.127")
+        self.dz_var            = tk.StringVar(value="0.110")
+        self.thr_var           = tk.StringVar(value="")
+        self.sep_var           = tk.StringVar(value="2.0")
+        self.margin_px_var     = tk.StringVar(value="2")
+        self.r2_thresh_var     = tk.StringVar(value="0.9")
+        self.rm_avg_var    = tk.BooleanVar(value=True)
+        self.rm_mean_var   = tk.BooleanVar(value=False)
+        self.rm_median_var = tk.BooleanVar(value=False)
+        self.roi_z_var         = tk.StringVar(value="2.5")
+        self.roi_y_var         = tk.StringVar(value="2.5")
+        self.roi_x_var         = tk.StringVar(value="2.5")
 
         for lbl, var, r, c in [
-            ("dx (µm):",                  self.dx_var,   0, 0),
-            ("dz (µm):",                  self.dz_var,   0, 2),
-            ("Threshold (auto if empty):", self.thr_var, 1, 0),
-            ("Best fraction:",             self.frac_var, 1, 2),
-            ("Min separation (µm):",       self.sep_var,  2, 0),
+            ("dx (µm):",                  self.dx_var,          0, 0),
+            ("dz (µm):",                  self.dz_var,          0, 2),
+            ("Threshold (auto if empty):", self.thr_var,        1, 0),
+            ("Min separation (µm):",       self.sep_var,        1, 2),
+            ("Edge margin (px):",          self.margin_px_var,  2, 0),
+            ("R² threshold:",              self.r2_thresh_var,  2, 2),
         ]:
             ttk.Label(pf, text=lbl).grid(row=r, column=c,   sticky="w", **PAD)
             ttk.Entry(pf, textvariable=var, width=10).grid(row=r, column=c+1, sticky="w", **PAD)
+
+        # Reporting mode: multi-select checkboxes
+        ttk.Label(pf, text="Report:").grid(row=3, column=0, sticky="w", **PAD)
+        ttk.Checkbutton(pf, text="avg-PSF",
+                        variable=self.rm_avg_var).grid(
+            row=3, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(pf, text="per-bead mean±SD",
+                        variable=self.rm_mean_var).grid(
+            row=3, column=2, columnspan=2, sticky="w", padx=4)
+        ttk.Checkbutton(pf, text="per-bead median±MAD",
+                        variable=self.rm_median_var).grid(
+            row=3, column=4, columnspan=2, sticky="w", padx=4)
 
         for lbl, var, c in [
             ("ROI Z (µm):", self.roi_z_var, 0),
             ("ROI Y (µm):", self.roi_y_var, 2),
             ("ROI X (µm):", self.roi_x_var, 4),
         ]:
-            ttk.Label(pf, text=lbl).grid(row=3, column=c,   sticky="w", **PAD)
-            ttk.Entry(pf, textvariable=var, width=10).grid(row=3, column=c+1, sticky="w", **PAD)
+            ttk.Label(pf, text=lbl).grid(row=4, column=c,   sticky="w", **PAD)
+            ttk.Entry(pf, textvariable=var, width=10).grid(row=4, column=c+1, sticky="w", **PAD)
 
         ttk.Label(pf,
                   text="ROI: extraction window around each bead. "
                        "Reduce ROI Z (e.g. 1.2) for thin volumes.",
-                  foreground="gray").grid(row=4, column=0, columnspan=6, sticky="w", padx=8)
+                  foreground="gray").grid(row=5, column=0, columnspan=6, sticky="w", padx=8)
 
         # Fitting mode
         fit_lbl = ttk.Label(pf, text="Fitting mode:")
-        fit_lbl.grid(row=5, column=0, sticky="w", **PAD)
+        fit_lbl.grid(row=6, column=0, sticky="w", **PAD)
 
         self.fit_mode_var = tk.StringVar(value="1d")
         ttk.Radiobutton(pf, text="1D sequential  (fast)",
                         variable=self.fit_mode_var, value="1d").grid(
-            row=5, column=1, columnspan=2, sticky="w", padx=4)
+            row=6, column=1, columnspan=2, sticky="w", padx=4)
         ttk.Radiobutton(pf, text="3D simultaneous  (accurate, slower)",
                         variable=self.fit_mode_var, value="3d").grid(
-            row=5, column=3, columnspan=3, sticky="w", padx=4)
+            row=6, column=3, columnspan=3, sticky="w", padx=4)
 
         ttk.Label(pf,
                   text="3D fits a full Gaussian to the ROI volume — more accurate for "
                        "asymmetric PSFs but ~10–100× slower per bead.",
-                  foreground="gray").grid(row=6, column=0, columnspan=6, sticky="w", padx=8)
+                  foreground="gray").grid(row=7, column=0, columnspan=6, sticky="w", padx=8)
 
         # --- Theoretical PSF (optional) ---
         tf = ttk.LabelFrame(param_row, text="Theoretical PSF (optional)")
@@ -416,20 +438,68 @@ class PSFScopeGUI:
         NavigationToolbar2Tk(self.fov_canvas, tb2)
 
     # =========================================================================
+    # Tab 5: FWHM histogram fit
+    # =========================================================================
+
+    def _build_hist_fit_tab(self, parent):
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        # 2 rows × 3 cols:  top = avg-PSF profiles, bottom = per-bead histograms
+        self.hfit_fig = Figure(figsize=(13, 7), tight_layout=True)
+        self.hfit_prof_z = self.hfit_fig.add_subplot(231)
+        self.hfit_prof_y = self.hfit_fig.add_subplot(232)
+        self.hfit_prof_x = self.hfit_fig.add_subplot(233)
+        self.hfit_hist_z = self.hfit_fig.add_subplot(234)
+        self.hfit_hist_y = self.hfit_fig.add_subplot(235)
+        self.hfit_hist_x = self.hfit_fig.add_subplot(236)
+
+        for ax, title in zip(
+            [self.hfit_prof_z, self.hfit_prof_y, self.hfit_prof_x],
+            ["Profile Z  (avg PSF)", "Profile Y  (avg PSF)", "Profile X  (avg PSF)"],
+        ):
+            ax.set_title(title, fontsize=9)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, color="gray")
+
+        for ax, title in zip(
+            [self.hfit_hist_z, self.hfit_hist_y, self.hfit_hist_x],
+            ["FWHM_z  per bead", "FWHM_y  per bead", "FWHM_x  per bead"],
+        ):
+            ax.set_title(title, fontsize=9)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, color="gray")
+
+        self.hfit_canvas = FigureCanvasTkAgg(self.hfit_fig, master=parent)
+        self.hfit_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        tb = ttk.Frame(parent)
+        tb.grid(row=1, column=0, sticky="ew")
+        NavigationToolbar2Tk(self.hfit_canvas, tb)
+
+    # =========================================================================
     # Run logic
     # =========================================================================
 
     def _parse_params(self):
-        dx       = float(self.dx_var.get())
-        dz       = float(self.dz_var.get())
-        thr      = float(self.thr_var.get()) if self.thr_var.get().strip() else None
-        frac     = float(self.frac_var.get())
-        sep      = float(self.sep_var.get())
+        dx             = float(self.dx_var.get())
+        dz             = float(self.dz_var.get())
+        thr            = float(self.thr_var.get()) if self.thr_var.get().strip() else None
+        sep            = float(self.sep_var.get())
+        margin_px      = int(self.margin_px_var.get())
+        r2_threshold   = float(self.r2_thresh_var.get())
+        reporting_mode = [m for m, v in [
+            ('averaged_psf',    self.rm_avg_var.get()),
+            ('per_bead_mean',   self.rm_mean_var.get()),
+            ('per_bead_median', self.rm_median_var.get()),
+        ] if v]
+        if not reporting_mode:
+            raise ValueError("Select at least one reporting mode.")
         roi      = (float(self.roi_z_var.get()),
                     float(self.roi_y_var.get()),
                     float(self.roi_x_var.get()))
         fit_mode = self.fit_mode_var.get()
-        return dx, dz, thr, frac, sep, roi, fit_mode
+        return dx, dz, thr, sep, margin_px, r2_threshold, reporting_mode, roi, fit_mode
 
     def _run(self):
         inp = self.input_var.get().strip()
@@ -438,7 +508,7 @@ class PSFScopeGUI:
             return
 
         try:
-            dx, dz, thr, frac, sep, roi, fit_mode = self._parse_params()
+            dx, dz, thr, sep, margin_px, r2_threshold, reporting_mode, roi, fit_mode = self._parse_params()
         except ValueError as e:
             messagebox.showerror("Parameter error", str(e))
             return
@@ -484,7 +554,9 @@ class PSFScopeGUI:
                             threshold         = thr,
                             min_sep_um        = sep,
                             roi_um            = roi,
-                            best_fraction     = frac,
+                            margin_px         = margin_px,
+                            r2_threshold      = r2_threshold,
+                            reporting_mode    = reporting_mode,
                             save_path         = save,
                             fit_mode          = fit_mode,
                             verbose           = True,
@@ -510,6 +582,28 @@ class PSFScopeGUI:
                     psf       = PSFScopeGUI._merge_psfs(results)
                     bead_data = PSFScopeGUI._merge_bead_data(results, ok_tif_files)
                     n_ok      = len(ok_tif_files)
+                    try:
+                        PSFScopeGUI._apply_combined_fwhm(psf, bead_data, dz, dx)
+                        n_used_total = bead_data['n_used']
+                        print(f"\n[PSF] ── Combined FWHM ({n_ok} volumes, "
+                              f"{n_used_total} beads) ──")
+                        for _axis, _avg, _mn, _sd, _med, _mad in [
+                            ('z', bead_data['fwhm_averaged_psf_z'],
+                             bead_data['fwhm_per_bead_mean_z'], bead_data['fwhm_per_bead_sd_z'],
+                             bead_data['fwhm_median_z'], bead_data['fwhm_mad_z']),
+                            ('y', bead_data['fwhm_averaged_psf_y'],
+                             bead_data['fwhm_per_bead_mean_y'], bead_data['fwhm_per_bead_sd_y'],
+                             bead_data['fwhm_median_y'], bead_data['fwhm_mad_y']),
+                            ('x', bead_data['fwhm_averaged_psf_x'],
+                             bead_data['fwhm_per_bead_mean_x'], bead_data['fwhm_per_bead_sd_x'],
+                             bead_data['fwhm_median_x'], bead_data['fwhm_mad_x']),
+                        ]:
+                            _avg_str = f"{_avg:.0f}" if np.isfinite(_avg) else "?"
+                            print(f"[PSF] FWHM_{_axis} = {_avg_str} nm (avg-PSF)   "
+                                  f"per-bead: mean={_mn:.0f}±{_sd:.0f} SD, "
+                                  f"median={_med:.0f} ±{_mad:.0f} MAD, N={n_used_total}")
+                    except Exception as _exc:
+                        print(f"[PSF] ⚠ Warning: combined FWHM computation failed: {_exc}")
                     skipped   = n - n_ok
                     save_path = (
                         f"{n_ok} volumes merged"
@@ -714,6 +808,19 @@ class PSFScopeGUI:
                          transform=self.fov_ax.transAxes, color="gray")
         self.fov_canvas.draw()
 
+        # --- FWHM diagnostics tab ---
+        for ax, title in zip(
+            [self.hfit_prof_z, self.hfit_prof_y, self.hfit_prof_x,
+             self.hfit_hist_z, self.hfit_hist_y, self.hfit_hist_x],
+            ["Profile Z  (avg PSF)", "Profile Y  (avg PSF)", "Profile X  (avg PSF)",
+             "FWHM_z  per bead",    "FWHM_y  per bead",    "FWHM_x  per bead"],
+        ):
+            ax.cla()
+            ax.set_title(title, fontsize=9)
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, color="gray")
+        self.hfit_canvas.draw()
+
         # Disable until the next successful run
         self.clear_btn.config(state="disabled")
         self.save_res_btn.config(state="disabled")
@@ -807,6 +914,64 @@ class PSFScopeGUI:
             'n_volumes':    len(results),
         }
 
+    @staticmethod
+    def _apply_combined_fwhm(psf, bead_data, dz, dx):
+        """Compute combined FWHM stats from a merged PSF + merged bead arrays.
+
+        Mutates *bead_data* in-place, injecting the same FWHM keys that
+        estimate_psf_from_beads produces for a single volume.  Called by
+        _worker after _merge_psfs / _merge_bead_data in batch mode.
+        """
+        dz_nm = dz * 1000.0
+        dx_nm = dx * 1000.0
+
+        avg = measure_fwhm_from_averaged_psf(psf, (dz_nm, dx_nm, dx_nm))
+        avg_z, avg_y, avg_x = avg['fwhm_z_nm'], avg['fwhm_y_nm'], avg['fwhm_x_nm']
+
+        used = bead_data['accepted_used']
+        fwhm_z = bead_data['accepted_sigma_z'][used] * 2.355 * 1000.0
+        fwhm_y = bead_data['accepted_sigma_y'][used] * 2.355 * 1000.0
+        fwhm_x = bead_data['accepted_sigma_x'][used] * 2.355 * 1000.0
+
+        def _stats(arr):
+            if len(arr) == 0:
+                nan = float('nan')
+                return nan, nan, nan, nan
+            mean_ = float(np.mean(arr))
+            sd_   = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            med_  = float(np.median(arr))
+            mad_  = float(np.median(np.abs(arr - med_)))
+            return mean_, sd_, med_, mad_
+
+        mean_z, sd_z, med_z, mad_z = _stats(fwhm_z)
+        mean_y, sd_y, med_y, mad_y = _stats(fwhm_y)
+        mean_x, sd_x, med_x, mad_x = _stats(fwhm_x)
+
+        def _r(v):
+            return round(v, 1) if np.isfinite(v) else None
+
+        bead_data.update({
+            'fwhm_averaged_psf_z': avg_z,
+            'fwhm_averaged_psf_y': avg_y,
+            'fwhm_averaged_psf_x': avg_x,
+            'fwhm_per_bead_mean_z': mean_z, 'fwhm_per_bead_mean_y': mean_y, 'fwhm_per_bead_mean_x': mean_x,
+            'fwhm_per_bead_sd_z':   sd_z,   'fwhm_per_bead_sd_y':   sd_y,   'fwhm_per_bead_sd_x':   sd_x,
+            'fwhm_median_z': med_z, 'fwhm_median_y': med_y, 'fwhm_median_x': med_x,
+            'fwhm_mad_z':    mad_z, 'fwhm_mad_y':    mad_y, 'fwhm_mad_x':    mad_x,
+            'reporting_mode': 'combined',
+            'fwhm_axes': {
+                'axis_z': {'fwhm_averaged_psf_nm': _r(avg_z),
+                           'fwhm_per_bead_mean_nm': _r(mean_z), 'fwhm_per_bead_sd_nm': _r(sd_z),
+                           'fwhm_per_bead_median_nm': _r(med_z), 'fwhm_per_bead_mad_nm': _r(mad_z)},
+                'axis_y': {'fwhm_averaged_psf_nm': _r(avg_y),
+                           'fwhm_per_bead_mean_nm': _r(mean_y), 'fwhm_per_bead_sd_nm': _r(sd_y),
+                           'fwhm_per_bead_median_nm': _r(med_y), 'fwhm_per_bead_mad_nm': _r(mad_y)},
+                'axis_x': {'fwhm_averaged_psf_nm': _r(avg_x),
+                           'fwhm_per_bead_mean_nm': _r(mean_x), 'fwhm_per_bead_sd_nm': _r(sd_x),
+                           'fwhm_per_bead_median_nm': _r(med_x), 'fwhm_per_bead_mad_nm': _r(mad_x)},
+            },
+        })
+
     # =========================================================================
     # Plot updates
     # =========================================================================
@@ -817,6 +982,7 @@ class PSFScopeGUI:
         if self._bead_data is not None:
             self._update_beads_plot()
             self._refresh_fov()
+            self._update_hist_fit_plots()
         self.nb.select(1)   # switch to PSF tab
 
     # ── PSF cross-sections ────────────────────────────────────────────────────
@@ -932,41 +1098,23 @@ class PSFScopeGUI:
         messagebox.showinfo("Saved", "Projections saved:\n" + "\n".join(saved))
 
     def _compute_fwhm_str(self, psf, dx, dz):
-        """Fit 1-D Gaussians to the PSF centre profiles and return a FWHM string."""
-        nz, ny, nx = psf.shape
-        cz, cy, cx = nz // 2, ny // 2, nx // 2
-
-        def _fwhm(coords, profile):
-            try:
-                bg = np.percentile(profile, 10)
-                A  = np.max(profile) - bg
-                if A <= 0:
-                    return None
-                c     = coords[np.argmax(profile)]
-                above = coords[profile > bg + 0.5 * A]
-                s     = (above[-1] - above[0]) / 2.355 if len(above) > 1 else coords[1] - coords[0]
-                popt, _ = curve_fit(
-                    lambda x, A, c, s, bg: A * np.exp(-(x-c)**2 / (2*s**2)) + bg,
-                    coords, profile.astype(float),
-                    p0=[A, c, max(abs(s), 1e-6), bg],
-                    bounds=([0, coords[0], 1e-6, 0],
-                            [np.inf, coords[-1], np.inf, np.inf]),
-                    maxfev=2000,
-                )
-                return abs(popt[2]) * 2.355   # FWHM in µm
-            except Exception:
-                return None
-
-        fz = _fwhm(np.arange(nz) * dz, psf[:, cy, cx])
-        fy = _fwhm(np.arange(ny) * dx, psf[cz, :, cx])
-        fx = _fwhm(np.arange(nx) * dx, psf[cz, cy, :])
-
+        """Measure FWHM from 1-D central profiles of the averaged PSF (non-parametric)."""
+        from postprocess_psf import measure_fwhm_from_averaged_psf
+        try:
+            fwhms = measure_fwhm_from_averaged_psf(
+                psf, (dz * 1000.0, dx * 1000.0, dx * 1000.0)
+            )
+        except Exception:
+            return ""
+        fz = fwhms['fwhm_z_nm']
+        fy = fwhms['fwhm_y_nm']
+        fx = fwhms['fwhm_x_nm']
         parts = []
-        if fz: parts.append(f"FWHM_z = {fz*1000:.0f} nm")
-        if fy: parts.append(f"FWHM_y = {fy*1000:.0f} nm")
-        if fx: parts.append(f"FWHM_x = {fx*1000:.0f} nm")
-        if fy and fx:
-            parts.append(f"FWHM_xy = {(fy+fx)/2*1000:.0f} nm")
+        if np.isfinite(fz): parts.append(f"FWHM_z = {fz:.0f} nm")
+        if np.isfinite(fy): parts.append(f"FWHM_y = {fy:.0f} nm")
+        if np.isfinite(fx): parts.append(f"FWHM_x = {fx:.0f} nm")
+        if np.isfinite(fy) and np.isfinite(fx):
+            parts.append(f"FWHM_xy = {(fy + fx) / 2:.0f} nm")
         return "   |   ".join(parts)
 
     # ── Beads: scatter + histograms ───────────────────────────────────────────
@@ -1131,26 +1279,183 @@ class PSFScopeGUI:
         self.hist_ax3.set_title("FWHM_xy vs bead Z position", fontsize=9)
         self.hist_ax3.legend(fontsize=7)
 
-        # Summary statistics
+        # Summary statistics — filter funnel
         n_used = len(used_idx)
         vol_prefix = f"Volumes: {bd['n_volumes']}  |  " if is_batch else ""
-        stats = (f"{vol_prefix}"
-                 f"Total candidates: {bd['n_total']}  |  "
-                 f"Border: {bd['n_border']}  |  "
-                 f"Quality rejected: {bd['n_quality_rejected']}  |  "
-                 f"Accepted: {bd['n_accepted']}  |  "
-                 f"Used: {n_used}")
+
+        # New-style filter counts (may not exist in files saved by older versions)
+        if 'n_edge' in bd:
+            funnel = (f"detected={bd['n_total']} → edge={bd['n_edge']} → "
+                      f"isolation={bd['n_isolation']} → fit_ok={bd['n_fit_ok']} → "
+                      f"amplitude={bd['n_amplitude']} → r²={bd['n_r2']} → "
+                      f"sanity={bd['n_sanity']}")
+        else:
+            funnel = (f"Total={bd['n_total']}  border={bd['n_border']}  "
+                      f"quality_rejected={bd['n_quality_rejected']}  "
+                      f"accepted={bd['n_accepted']}")
+
+        stats = f"{vol_prefix}Beads: {funnel}  |  Used: {n_used}"
+
         if n_used:
-            stats += (f"\nFWHM_xy: {fwhm_xy[used_idx].mean():.0f} ± "
-                      f"{fwhm_xy[used_idx].std():.0f} nm    "
-                      f"FWHM_z: {fwhm_z[used_idx].mean():.0f} ± "
-                      f"{fwhm_z[used_idx].std():.0f} nm")
+            avg_z = bd.get('fwhm_averaged_psf_z', float('nan'))
+            avg_y = bd.get('fwhm_averaged_psf_y', float('nan'))
+            avg_x = bd.get('fwhm_averaged_psf_x', float('nan'))
+            sd_z  = bd.get('fwhm_per_bead_sd_z',  float('nan'))
+            med_y = bd.get('fwhm_median_y',        float('nan'))
+            med_x = bd.get('fwhm_median_x',        float('nan'))
+
+            if np.isfinite(avg_z):
+                avg_xy = 0.5 * (avg_y + avg_x) if (np.isfinite(avg_y) and np.isfinite(avg_x)) \
+                         else float('nan')
+                med_xy = 0.5 * (med_y + med_x)
+                avg_xy_s = f"{avg_xy:.0f}" if np.isfinite(avg_xy) else "?"
+                sd_z_s   = f" ±{sd_z:.0f} SD" if np.isfinite(sd_z) else ""
+                stats += (f"\nFWHM_xy: {avg_xy_s} nm (avg-PSF)   "
+                          f"per-bead median: {med_xy:.0f} nm"
+                          f"\nFWHM_z:  {avg_z:.0f} nm (avg-PSF){sd_z_s} per-bead")
+            else:
+                stats += (f"\nFWHM_xy: {fwhm_xy[used_idx].mean():.0f} ± "
+                          f"{fwhm_xy[used_idx].std():.0f} nm    "
+                          f"FWHM_z: {fwhm_z[used_idx].mean():.0f} ± "
+                          f"{fwhm_z[used_idx].std():.0f} nm")
         self.beads_stats_var.set(stats)
 
         self.beads_fig.tight_layout()
         self.beads_canvas.draw()
         self.hist_fig.tight_layout()
         self.hist_canvas.draw()
+
+    # ── FWHM histogram fit plots ──────────────────────────────────────────────
+
+    def _update_hist_fit_plots(self):
+        bd  = self._bead_data
+        psf = self._psf
+        if bd is None or psf is None:
+            return
+
+        from postprocess_psf import measure_fwhm_from_averaged_psf
+        from scipy.interpolate import CubicSpline
+
+        try:
+            dx = float(self.dx_var.get())
+            dz = float(self.dz_var.get())
+        except ValueError:
+            dx = dz = 1.0
+
+        # ── Top row: 1-D profiles of the averaged PSF ─────────────────────────
+        try:
+            avg_fwhm = measure_fwhm_from_averaged_psf(
+                psf, (dz * 1000.0, dx * 1000.0, dx * 1000.0)
+            )
+        except Exception:
+            avg_fwhm = {'fwhm_z_nm': float('nan'),
+                        'fwhm_y_nm': float('nan'),
+                        'fwhm_x_nm': float('nan')}
+
+        nz, ny, nx = psf.shape
+        iz, iy, ix = np.unravel_index(np.argmax(psf), psf.shape)
+
+        profile_specs = [
+            (self.hfit_prof_z, psf[:, iy, ix], np.arange(nz) * dz * 1000,
+             "z (nm)", "Profile Z  (avg PSF)", avg_fwhm['fwhm_z_nm']),
+            (self.hfit_prof_y, psf[iz, :, ix], np.arange(ny) * dx * 1000,
+             "y (nm)", "Profile Y  (avg PSF)", avg_fwhm['fwhm_y_nm']),
+            (self.hfit_prof_x, psf[iz, iy, :], np.arange(nx) * dx * 1000,
+             "x (nm)", "Profile X  (avg PSF)", avg_fwhm['fwhm_x_nm']),
+        ]
+
+        for ax, profile, coords, xlabel, title, fwhm_nm in profile_specs:
+            ax.cla()
+            ax.set_title(title, fontsize=9)
+
+            bg       = float(np.percentile(profile, 5))
+            peak     = float(np.max(profile)) - bg
+            half_max = bg + 0.5 * peak if peak > 0 else float('nan')
+
+            coords_fine  = np.linspace(coords[0], coords[-1], len(coords) * 10)
+            profile_fine = CubicSpline(coords, profile)(coords_fine)
+
+            ax.plot(coords, profile, 'o', ms=3, color='steelblue', alpha=0.6,
+                    zorder=3)
+            ax.plot(coords_fine, profile_fine, '-', color='steelblue', lw=1.2,
+                    zorder=2)
+            if np.isfinite(half_max):
+                ax.axhline(half_max, color='red', lw=0.9, ls='--', alpha=0.8,
+                           label="50%")
+            ax.axhline(bg, color='gray', lw=0.6, ls=':', alpha=0.6,
+                       label="BG (p5)")
+
+            if np.isfinite(fwhm_nm):
+                ax.text(0.05, 0.92, f"FWHM = {fwhm_nm:.0f} nm",
+                        transform=ax.transAxes, fontsize=8, color='red',
+                        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8))
+
+            ax.set_xlabel(xlabel, fontsize=8)
+            ax.set_ylabel("Intensity", fontsize=8)
+            ax.legend(fontsize=7, loc="upper right")
+
+        # ── Bottom row: per-bead FWHM histograms ──────────────────────────────
+        used      = bd['accepted_used']
+        fwhm_z_nm = bd['accepted_sigma_z'][used] * 2.355 * 1000
+        fwhm_y_nm = bd['accepted_sigma_y'][used] * 2.355 * 1000
+        fwhm_x_nm = bd['accepted_sigma_x'][used] * 2.355 * 1000
+
+        hist_specs = [
+            (self.hfit_hist_z, fwhm_z_nm, "FWHM_z (nm)", "FWHM_z  per bead",
+             bd.get('fwhm_per_bead_mean_z'), bd.get('fwhm_per_bead_sd_z'),
+             bd.get('fwhm_median_z'),         bd.get('fwhm_mad_z')),
+            (self.hfit_hist_y, fwhm_y_nm, "FWHM_y (nm)", "FWHM_y  per bead",
+             bd.get('fwhm_per_bead_mean_y'), bd.get('fwhm_per_bead_sd_y'),
+             bd.get('fwhm_median_y'),         bd.get('fwhm_mad_y')),
+            (self.hfit_hist_x, fwhm_x_nm, "FWHM_x (nm)", "FWHM_x  per bead",
+             bd.get('fwhm_per_bead_mean_x'), bd.get('fwhm_per_bead_sd_x'),
+             bd.get('fwhm_median_x'),         bd.get('fwhm_mad_x')),
+        ]
+
+        for ax, fwhm_nm, xlabel, title, mn, sd, med, mad in hist_specs:
+            ax.cla()
+            ax.set_title(title, fontsize=9)
+
+            if len(fwhm_nm) == 0:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        transform=ax.transAxes, color="gray")
+                ax.set_xlabel(xlabel, fontsize=8)
+                continue
+
+            counts, edges = np.histogram(fwhm_nm, bins='fd')
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            ax.bar(centers, counts, width=np.diff(edges),
+                   color="steelblue", alpha=0.50)
+
+            # Fallback to raw arrays if bead_data scalars not available
+            mn_v  = mn  if mn  is not None else float(np.mean(fwhm_nm))
+            sd_v  = sd  if sd  is not None else float(np.std(fwhm_nm))
+            med_v = med if med is not None else float(np.median(fwhm_nm))
+            mad_v = mad if mad is not None else float(
+                np.median(np.abs(fwhm_nm - np.median(fwhm_nm))))
+
+            ax.axvline(mn_v,  color="steelblue", lw=1.8,
+                       label=f"Mean   {mn_v:.0f} nm")
+            ax.axvline(med_v, color="green",     lw=1.8, ls="--",
+                       label=f"Median {med_v:.0f} nm")
+            ax.axvspan(mn_v  - sd_v,  mn_v  + sd_v,  alpha=0.10,
+                       color="steelblue", label=f"±SD {sd_v:.0f}")
+            ax.axvspan(med_v - mad_v, med_v + mad_v, alpha=0.10,
+                       color="green",     label=f"±MAD {mad_v:.0f}")
+
+            txt = (f"Mean   = {mn_v:.0f} ± {sd_v:.0f} nm\n"
+                   f"Median = {med_v:.0f} ± {mad_v:.0f} nm\n"
+                   f"N = {len(fwhm_nm)}")
+            ax.text(0.97, 0.97, txt, transform=ax.transAxes,
+                    ha="right", va="top", fontsize=7,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+
+            ax.set_xlabel(xlabel, fontsize=8)
+            ax.set_ylabel("Count", fontsize=8)
+            ax.legend(fontsize=7, loc="upper left")
+
+        self.hfit_fig.tight_layout()
+        self.hfit_canvas.draw()
 
     # ── FOV resolution map ────────────────────────────────────────────────────
 

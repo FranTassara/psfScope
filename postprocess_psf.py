@@ -59,6 +59,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import scipy.ndimage as ndi
+from scipy.interpolate import CubicSpline
 from scipy.optimize import curve_fit
 from skimage.feature import peak_local_max
 from tifffile import imread, imwrite
@@ -68,6 +69,15 @@ try:
     _HAS_PSFMODELS = True
 except ImportError:
     _HAS_PSFMODELS = False
+
+
+def _r2_score(y_true, y_pred):
+    """Coefficient of determination R² = 1 - SS_res / SS_tot."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
 # =============================================================================
@@ -244,23 +254,24 @@ def _fit_gaussian1d(coords, profile):
         return None
 
 
-def _quality_check_1d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px):
+def _quality_check_1d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds):
     """
     Assess bead quality via 1-D Gaussian fits along Z, Y, and X.
 
-    In addition to pass/fail, returns the sub-pixel offset of the fitted
-    Gaussian centre from the geometric ROI centre.  This offset is used
-    to sub-pixel-align the bead before averaging.
+    Sigma bounds are used as curve_fit constraints but NOT as rejection
+    criteria — the caller's filter stack (_filter_sanity, _filter_r2) handles
+    rejection.  Returns ok=False only when a fit fails to converge.
 
     Returns
     -------
-    passes : bool
-    sigma_z : float or None  [µm]
-    sigma_y : float or None  [µm]
-    sigma_x : float or None  [µm]
-    offset_px : tuple (oz, oy, ox) in pixels, or None
-        Shift needed to move the Gaussian centre to the ROI centre.
-        Apply as ndi.shift(roi, -offset_px).
+    ok         : bool
+    sigma_z    : float or None  [µm]
+    sigma_y    : float or None  [µm]
+    sigma_x    : float or None  [µm]
+    offset_px  : tuple (oz, oy, ox) in pixels, or None
+    amplitude  : float or None  — mean of the three 1-D amplitudes
+    background : float or None  — mean of the three 1-D backgrounds
+    r2         : float or None  — minimum R² across the three 1-D fits
     """
     nz, ny, nx = roi.shape
     iz, iy, ix = np.unravel_index(np.argmax(roi), roi.shape)
@@ -274,38 +285,37 @@ def _quality_check_1d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_o
     fx = _fit_gaussian1d(x_coords, roi[iz, iy, :])
 
     if fz is None or fy is None or fx is None:
-        return False, None, None, None, None
+        return False, None, None, None, None, None, None, None
 
     sz = abs(fz[2])
     sy = abs(fy[2])
     sx = abs(fx[2])
 
-    if not (sigma_z_bounds[0]  <= sz <= sigma_z_bounds[1]):
-        return False, sz, sy, sx, None
-    if not (sigma_xy_bounds[0] <= sy <= sigma_xy_bounds[1]):
-        return False, sz, sy, sx, None
-    if not (sigma_xy_bounds[0] <= sx <= sigma_xy_bounds[1]):
-        return False, sz, sy, sx, None
-
-    # Offset of the Gaussian centre from the ROI geometric centre
+    # Sub-pixel centre offset from the ROI geometric centre
     cz_fit, cy_fit, cx_fit = fz[1], fy[1], fx[1]
     roi_cz = (nz // 2) * dz
     roi_cy = (ny // 2) * dx
     roi_cx = (nx // 2) * dx
-
-    if abs(cz_fit - roi_cz) > max_center_offset_px * dz:
-        return False, sz, sy, sx, None
-    if abs(cy_fit - roi_cy) > max_center_offset_px * dx:
-        return False, sz, sy, sx, None
-    if abs(cx_fit - roi_cx) > max_center_offset_px * dx:
-        return False, sz, sy, sx, None
 
     offset_px = (
         (cz_fit - roi_cz) / dz,
         (cy_fit - roi_cy) / dx,
         (cx_fit - roi_cx) / dx,
     )
-    return True, sz, sy, sx, offset_px
+
+    amplitude  = float((fz[0] + fy[0] + fx[0]) / 3.0)
+    background = float((fz[3] + fy[3] + fx[3]) / 3.0)
+
+    def _gauss(x, A, c, s, bg):
+        return A * np.exp(-(x - c) ** 2 / (2 * s ** 2)) + bg
+
+    r2 = min(
+        _r2_score(roi[:, iy, ix], _gauss(z_coords, *fz)),
+        _r2_score(roi[iz, :, ix], _gauss(y_coords, *fy)),
+        _r2_score(roi[iz, iy, :], _gauss(x_coords, *fx)),
+    )
+
+    return True, sz, sy, sx, offset_px, amplitude, background, r2
 
 
 def _radial_symmetry_3d(roi):
@@ -389,22 +399,20 @@ def _radial_symmetry_3d(roi):
             float(np.clip(xc, 0, nx - 1)))
 
 
-def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px):
+def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds):
     """
     Assess bead quality via a simultaneous 3-D Gaussian fit.
 
     Fits  I(z,y,x) = A·exp(-((z-cz)²/2σz² + (y-cy)²/2σy² + (x-cx)²/2σx²)) + bg
     to the entire ROI volume in physical-unit (µm) coordinates.
 
-    Initial parameter guesses use _radial_symmetry_3d for the centre (cz, cy, cx)
-    — sub-pixel accuracy without iteration — and the empirical half-maximum width
-    of each 1-D profile for the sigmas.  Better starting points reduce the number
-    of Gaussian-fit iterations, particularly for off-axis beads.
+    Sigma bounds are used as curve_fit constraints but NOT as rejection
+    criteria — the caller's filter stack handles rejection.
 
     Returns
     -------
-    Same signature as _quality_check_1d:
-    (passes, sigma_z, sigma_y, sigma_x, offset_px)
+    Same extended signature as _quality_check_1d:
+    (ok, sigma_z, sigma_y, sigma_x, offset_px, amplitude, background, r2)
     """
     nz, ny, nx = roi.shape
     iz, iy, ix = np.unravel_index(np.argmax(roi), roi.shape)
@@ -484,37 +492,25 @@ def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_o
             maxfev=5000,
         )
     except Exception:
-        return False, None, None, None, None
+        return False, None, None, None, None, None, None, None
 
-    _, cz_fit, cy_fit, cx_fit, sz, sy, sx, _ = popt
+    A_fit, cz_fit, cy_fit, cx_fit, sz, sy, sx, bg_fit = popt
     sz, sy, sx = abs(sz), abs(sy), abs(sx)
 
-    # Sigma bounds check
-    if not (sigma_z_bounds[0]  <= sz <= sigma_z_bounds[1]):
-        return False, sz, sy, sx, None
-    if not (sigma_xy_bounds[0] <= sy <= sigma_xy_bounds[1]):
-        return False, sz, sy, sx, None
-    if not (sigma_xy_bounds[0] <= sx <= sigma_xy_bounds[1]):
-        return False, sz, sy, sx, None
-
-    # Centre offset check
     roi_cz = (nz // 2) * dz
     roi_cy = (ny // 2) * dx
     roi_cx = (nx // 2) * dx
-
-    if abs(cz_fit - roi_cz) > max_center_offset_px * dz:
-        return False, sz, sy, sx, None
-    if abs(cy_fit - roi_cy) > max_center_offset_px * dx:
-        return False, sz, sy, sx, None
-    if abs(cx_fit - roi_cx) > max_center_offset_px * dx:
-        return False, sz, sy, sx, None
 
     offset_px = (
         (cz_fit - roi_cz) / dz,
         (cy_fit - roi_cy) / dx,
         (cx_fit - roi_cx) / dx,
     )
-    return True, sz, sy, sx, offset_px
+
+    y_pred = _gauss3d(coords_flat, *popt)
+    r2     = _r2_score(data_flat, y_pred)
+
+    return True, sz, sy, sx, offset_px, float(A_fit), float(bg_fit), float(r2)
 
 
 def _center_and_average(rois, offsets):
@@ -549,51 +545,46 @@ def _center_and_average(rois, offsets):
 
 
 def _process_one_bead(cz, cy, cx, volume, nz, ny, nx, rz, ry, rx,
-                       dx, dz, sigma_xy_bounds, sigma_z_bounds,
-                       max_center_offset_px, fit_mode):
+                       dx, dz, sigma_xy_bounds, sigma_z_bounds, fit_mode):
     """
-    Process one bead candidate: border check, ROI extraction, quality filter,
-    and SNR computation.
+    Extract ROI and run Gaussian fit for one bead candidate.
 
-    Designed to be called from both a sequential loop and a
-    ThreadPoolExecutor.  ``volume`` is accessed read-only; NumPy slicing is
-    thread-safe, and SciPy/NumPy routines release the GIL so multiple threads
-    can run their Gaussian fits concurrently.
+    Border/edge checking is performed externally by _filter_edge before
+    calling this function.  Designed for both sequential loops and
+    ThreadPoolExecutor (volume is read-only; SciPy/NumPy release the GIL).
 
     Returns
     -------
-    dict with key ``status`` in {'border', 'rejected', 'accepted'} plus
-    per-bead data for accepted beads (roi, sz, sy, sx, offset_px, snr).
+    dict with ``status`` in {'fit_ok', 'fit_failed'} plus, for fit_ok:
+        roi, sz, sy, sx, offset_px, snr, amplitude, background, r2,
+        peak_offset_px — peak displacement from ROI centre in pixels,
+                         used by _filter_sanity.
     """
-    # Border check
-    if (cz < rz or cz + rz + 1 > nz or
-            cy < ry or cy + ry + 1 > ny or
-            cx < rx or cx + rx + 1 > nx):
-        return {'status': 'border', 'pos': (int(cz), int(cy), int(cx))}
-
     roi = volume[
         cz - rz : cz + rz + 1,
         cy - ry : cy + ry + 1,
         cx - rx : cx + rx + 1,
     ].astype(np.float32)
 
-    # Local background subtraction (5th percentile of the ROI)
     roi -= np.percentile(roi, 5)
     roi  = np.clip(roi, 0, None)
 
     if fit_mode == '3d':
-        ok, sz, sy, sx, offset_px = _quality_check_3d(
-            roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px
+        ok, sz, sy, sx, offset_px, amp, bg, r2 = _quality_check_3d(
+            roi, dx, dz, sigma_xy_bounds, sigma_z_bounds
         )
     else:
-        ok, sz, sy, sx, offset_px = _quality_check_1d(
-            roi, dx, dz, sigma_xy_bounds, sigma_z_bounds, max_center_offset_px
+        ok, sz, sy, sx, offset_px, amp, bg, r2 = _quality_check_1d(
+            roi, dx, dz, sigma_xy_bounds, sigma_z_bounds
         )
 
     if not ok:
-        return {'status': 'rejected', 'pos': (int(cz), int(cy), int(cx))}
+        return {'status': 'fit_failed', 'pos': (int(cz), int(cy), int(cx))}
 
-    # SNR: peak signal / std of the ROI outer shell (background noise estimate)
+    # Peak pixel relative to ROI geometric centre (for sanity filter)
+    iz, iy, ix = np.unravel_index(np.argmax(roi), roi.shape)
+    peak_offset_px = (float(iz - rz), float(iy - ry), float(ix - rx))
+
     outer_shell = np.concatenate([
         roi[0].ravel(), roi[-1].ravel(),
         roi[:, 0, :].ravel(), roi[:, -1, :].ravel(),
@@ -602,20 +593,365 @@ def _process_one_bead(cz, cy, cx, volume, nz, ny, nx, rz, ry, rx,
     snr = float(np.max(roi)) / max(float(np.std(outer_shell)), 1e-6)
 
     return {
-        'status':    'accepted',
-        'pos':       (int(cz), int(cy), int(cx)),
-        'roi':       roi,
-        'sz':        sz,
-        'sy':        sy,
-        'sx':        sx,
-        'offset_px': offset_px,
-        'snr':       snr,
+        'status':         'fit_ok',
+        'pos':            (int(cz), int(cy), int(cx)),
+        'roi':            roi,
+        'sz':             sz,
+        'sy':             sy,
+        'sx':             sx,
+        'offset_px':      offset_px,
+        'snr':            snr,
+        'amplitude':      amp,
+        'background':     bg,
+        'r2':             r2,
+        'peak_offset_px': peak_offset_px,
     }
 
 
 # =============================================================================
+# Sequential bead filter stack
+# =============================================================================
+
+def _filter_edge(candidates, vol_shape, rz, ry, rx, margin_px=2):
+    """
+    Retain candidates whose ROI + margin fits strictly inside the volume.
+
+    This extends the basic ROI-bounds check: margin_px (default 2) adds a
+    safety buffer beyond the half-ROI so that shifted ROIs from sub-pixel
+    alignment never read outside the array.
+
+    Orthogonal to σ: selection is based only on spatial position.
+
+    Returns
+    -------
+    keep : ndarray (M, 3)  — surviving candidate positions
+    """
+    nz, ny, nx = vol_shape
+    mz, my, mx = rz + margin_px, ry + margin_px, rx + margin_px
+    mask = (
+        (candidates[:, 0] >= mz) & (candidates[:, 0] + mz < nz) &
+        (candidates[:, 1] >= my) & (candidates[:, 1] + my < ny) &
+        (candidates[:, 2] >= mx) & (candidates[:, 2] + mx < nx)
+    )
+    return candidates[mask]
+
+
+def _filter_isolation(candidates, min_sep_um, dx, dz):
+    """
+    Retain candidates whose nearest neighbour is at least min_sep_um away.
+
+    This filter is complementary to the NMS footprint used in peak_local_max:
+    - NMS prevents double-detection during peak finding (threshold ~1×FWHM).
+    - This filter enforces a stricter threshold (typically ~3×FWHM_lateral)
+      to discard beads whose PSFs may optically overlap even if they were
+      detected as separate peaks.  Overlapping PSFs produce systematic biases
+      in the Gaussian fit (broader sigma, distorted shape) that degrade the
+      averaged PSF.
+
+    Orthogonal to σ: selection is based only on spatial position.
+
+    Returns
+    -------
+    keep_idx : list[int]  — indices into candidates that survive
+    """
+    n = len(candidates)
+    if n <= 1:
+        return list(range(n))
+
+    pos_um = candidates.astype(float) * np.array([dz, dx, dx])
+    keep   = []
+    for i in range(n):
+        diff  = pos_um - pos_um[i]
+        dists = np.sqrt((diff ** 2).sum(axis=1))
+        dists[i] = np.inf
+        if dists.min() >= min_sep_um:
+            keep.append(i)
+    return keep
+
+
+def _filter_amplitude(bead_list):
+    """
+    Discard beads whose fitted amplitude is an outlier by MAD criterion.
+
+    Hampel identifier: |amplitude − median| > 3 × 1.4826 × MAD.
+    The factor 1.4826 makes MAD a consistent estimator of the Gaussian sigma,
+    so the threshold is equivalent to ±3σ for a Gaussian distribution.
+
+    Orthogonal to σ: filters on bead brightness, not on PSF width.
+    Catches: photobleached beads (dim), bead clusters or saturated pixels
+    (very bright).
+
+    Returns
+    -------
+    keep_idx : list[int]
+    """
+    if len(bead_list) < 3:
+        return list(range(len(bead_list)))
+    amplitudes = np.array([b['amplitude'] for b in bead_list])
+    med = np.median(amplitudes)
+    mad = np.median(np.abs(amplitudes - med))
+    thr = 3.0 * 1.4826 * mad
+    return [i for i, a in enumerate(amplitudes) if abs(a - med) <= thr]
+
+
+def _filter_r2(bead_list, r2_threshold=0.9):
+    """
+    Discard beads where the Gaussian fit quality R² < r2_threshold.
+
+    R² measures how well the Gaussian model describes the bead PSF,
+    independently of the sigma value.  Low R² indicates: non-Gaussian shape
+    (doublets, debris), fitting artefacts, or insufficient SNR.
+
+    Returns
+    -------
+    keep_idx : list[int]
+    """
+    return [i for i, b in enumerate(bead_list) if b['r2'] >= r2_threshold]
+
+
+def _filter_sanity(bead_list, sigma_xy_bounds, sigma_z_bounds,
+                   max_offset_px=1.5):
+    """
+    Discard beads failing any of three sanity checks.
+
+    1. Centre displacement — |fit_centre − intensity_peak| > max_offset_px (px)
+       in any axis.  Indicates convergence far from the bead, typically due to
+       asymmetric noise or an adjacent undetected bead.
+
+    2. Background — background < 0 or background > max(ROI).
+       Unphysical fit, likely from a degenerate data region.
+
+    3. Sigma at upper bound — any σ within 5 % of the curve_fit upper bound.
+       The fit hit the constraint wall; the sigma value is an artefact, not a
+       physical measurement.
+
+    Returns
+    -------
+    keep_idx : list[int]
+    """
+    keep = []
+    for i, b in enumerate(bead_list):
+        oz, oy, ox   = b['offset_px']
+        pz, py, px   = b['peak_offset_px']
+
+        # 1. Centre displacement between fit and initial peak
+        if max(abs(oz - pz), abs(oy - py), abs(ox - px)) > max_offset_px:
+            continue
+
+        # 2. Unphysical background
+        max_roi = float(np.max(b['roi']))
+        if b['background'] < 0 or b['background'] > max_roi:
+            continue
+
+        # 3. Sigma at upper bound (within 5 %)
+        if b['sz'] >= sigma_z_bounds[1]  * 0.95:
+            continue
+        if b['sy'] >= sigma_xy_bounds[1] * 0.95:
+            continue
+        if b['sx'] >= sigma_xy_bounds[1] * 0.95:
+            continue
+
+        keep.append(i)
+    return keep
+
+
+# =============================================================================
+# FWHM measurement helpers
+# =============================================================================
+
+# =============================================================================
 # Public API
 # =============================================================================
+
+def measure_fwhm_from_averaged_psf(psf_3d, voxel_size_nm):
+    """
+    Measure FWHM along each axis from the central 1-D profiles of an averaged PSF.
+
+    Does not assume Gaussian shape.  Extracts profiles through the voxel of
+    maximum intensity, subtracts the 5th-percentile background, interpolates
+    at 10× resolution with CubicSpline, then finds the half-maximum crossings
+    by linear interpolation between consecutive interpolated samples.
+
+    Parameters
+    ----------
+    psf_3d : ndarray, shape (nz, ny, nx)
+        Averaged, normalised PSF (any dtype; converted to float internally).
+    voxel_size_nm : tuple (dz_nm, dy_nm, dx_nm)
+        Physical voxel size in nanometres per axis.
+
+    Returns
+    -------
+    dict with keys:
+        fwhm_z_nm : float  — FWHM along Z [nm], or nan if measurement fails
+        fwhm_y_nm : float  — FWHM along Y [nm], or nan if measurement fails
+        fwhm_x_nm : float  — FWHM along X [nm], or nan if measurement fails
+    """
+    psf = np.asarray(psf_3d, dtype=float)
+    nz, ny, nx = psf.shape
+    dz_nm, dy_nm, dx_nm = float(voxel_size_nm[0]), float(voxel_size_nm[1]), float(voxel_size_nm[2])
+
+    iz, iy, ix = np.unravel_index(np.argmax(psf), psf.shape)
+
+    def _fwhm_1d(profile, vox_nm):
+        n = len(profile)
+        if n < 3:
+            return float('nan')
+        coords = np.arange(n) * vox_nm
+        bg     = float(np.percentile(profile, 5))
+        peak   = float(np.max(profile)) - bg
+        if peak <= 0:
+            return float('nan')
+        half_max = bg + 0.5 * peak
+
+        coords_fine  = np.linspace(coords[0], coords[-1], n * 10)
+        profile_fine = CubicSpline(coords, profile)(coords_fine)
+
+        above   = profile_fine >= half_max
+        diffs   = np.diff(above.astype(np.int8))
+        rising  = np.where(diffs ==  1)[0]
+        falling = np.where(diffs == -1)[0]
+
+        if len(rising) == 0 or len(falling) == 0:
+            return float('nan')
+
+        def _cross(idx):
+            y0, y1 = profile_fine[idx], profile_fine[idx + 1]
+            x0, x1 = coords_fine[idx], coords_fine[idx + 1]
+            if y1 == y0:
+                return x0
+            return x0 + (half_max - y0) / (y1 - y0) * (x1 - x0)
+
+        left  = _cross(rising[0])
+        right = _cross(falling[-1])
+        return right - left if right > left else float('nan')
+
+    return {
+        'fwhm_z_nm': _fwhm_1d(psf[:, iy, ix], dz_nm),
+        'fwhm_y_nm': _fwhm_1d(psf[iz, :, ix], dy_nm),
+        'fwhm_x_nm': _fwhm_1d(psf[iz, iy, :], dx_nm),
+    }
+
+
+def _fit_psf_from_histogram_diagnostic(fwhm_values, window_fraction=0.5):
+    """
+    Fit a Gaussian to the histogram mode of per-bead FWHM values.
+
+    DIAGNOSTIC ONLY — not used for reporting.  Retained for optional JSON
+    output when diagnostic_histogram_fit=True.  This estimator is not standard
+    in SOLS/OPM literature and is not robust for small N or skewed distributions.
+
+    Returns
+    -------
+    dict with keys: mu_fit, sigma_fit, n_used, r2, bin_centers, counts,
+                    fit_mask, mode_kde
+    """
+    from scipy.stats import gaussian_kde as _gaussian_kde
+    fwhm_values = np.asarray(fwhm_values, dtype=float)
+    fwhm_values = fwhm_values[np.isfinite(fwhm_values)]
+    n = len(fwhm_values)
+
+    _nan = float('nan')
+    if n < 4:
+        mu = float(np.median(fwhm_values)) if n > 0 else _nan
+        return dict(mu_fit=mu, sigma_fit=_nan, n_used=n, r2=_nan,
+                    bin_centers=np.array([mu] if n > 0 else []),
+                    counts=np.array([n] if n > 0 else []),
+                    fit_mask=np.array([True] if n > 0 else [], dtype=bool),
+                    mode_kde=mu)
+
+    # Step 1: Freedman-Diaconis histogram
+    counts, edges = np.histogram(fwhm_values, bins='fd')
+    bin_centers   = 0.5 * (edges[:-1] + edges[1:])
+
+    # Step 2: KDE mode on fine grid — avoids bin-size dependence
+    try:
+        kde      = _gaussian_kde(fwhm_values)
+        grid     = np.linspace(fwhm_values.min(), fwhm_values.max(), 1000)
+        mode_kde = float(grid[np.argmax(kde(grid))])
+    except np.linalg.LinAlgError:
+        # All values identical (singular covariance); fall back to mean
+        mode_kde = float(fwhm_values.mean())
+
+    # Step 3: connected window around the KDE mode
+    # Use histogram peak bin as anchor when KDE mode diverges (skewed distributions,
+    # small N).  KDE provides sub-bin precision only when it stays within one
+    # bin-width of the histogram peak.
+    count_max  = float(counts.max())
+    peak_bin   = int(np.argmax(counts))
+    bin_width  = float(edges[1] - edges[0])
+    if abs(mode_kde - bin_centers[peak_bin]) > 1.5 * bin_width:
+        anchor = bin_centers[peak_bin]
+    else:
+        anchor = mode_kde
+    mode_bin = int(np.clip(np.searchsorted(edges[1:], anchor, side='left'),
+                           0, len(counts) - 1))
+
+    def _grow_window(thr):
+        m = np.zeros(len(counts), dtype=bool)
+        m[mode_bin] = True
+        for j in range(mode_bin - 1, -1, -1):
+            if counts[j] >= thr:
+                m[j] = True
+            else:
+                break
+        for j in range(mode_bin + 1, len(counts)):
+            if counts[j] >= thr:
+                m[j] = True
+            else:
+                break
+        return m
+
+    fit_mask = _grow_window(window_fraction * count_max)
+
+    # Expand window to at least 5 bins for a well-conditioned 3-parameter fit.
+    # Progressively lower the threshold; fall back to the nearest-bin expansion.
+    n_min_bins = 5
+    for frac in (0.30, 0.15, 0.05, 0.0):
+        if fit_mask.sum() >= n_min_bins:
+            break
+        fit_mask = _grow_window(frac * count_max)
+    if fit_mask.sum() < n_min_bins and len(counts) >= n_min_bins:
+        dist = np.abs(np.arange(len(counts)) - mode_bin)
+        for idx in np.argsort(dist):
+            fit_mask[idx] = True
+            if fit_mask.sum() >= n_min_bins:
+                break
+
+    x_fit = bin_centers[fit_mask]
+    y_fit = counts[fit_mask].astype(float)
+
+    if len(x_fit) < 3:
+        return dict(mu_fit=anchor, sigma_fit=_nan, n_used=int(fit_mask.sum()),
+                    r2=_nan, bin_centers=bin_centers, counts=counts,
+                    fit_mask=fit_mask, mode_kde=mode_kde)
+
+    # Step 4: Poisson-weighted Gaussian fit
+    w   = np.sqrt(y_fit + 1.0)
+    A0  = count_max
+    mu0 = float(x_fit[np.argmax(y_fit)])   # initial guess from window peak
+    s0  = max((x_fit[-1] - x_fit[0]) / (2.0 * 2.355),
+              bin_width * 0.5)
+    try:
+        popt, _ = curve_fit(
+            lambda x, A, mu, sig: A * np.exp(-(x - mu) ** 2 / (2 * sig ** 2)),
+            x_fit, y_fit,
+            p0=[A0, mu0, s0],
+            sigma=w, absolute_sigma=True,
+            bounds=([0,    x_fit.min(), 1e-6],
+                    [np.inf, x_fit.max(), np.inf]),
+            maxfev=4000,
+        )
+        A_f, mu_f, sig_f = popt
+        y_pred = A_f * np.exp(-(x_fit - mu_f) ** 2 / (2 * sig_f ** 2))
+        r2     = _r2_score(y_fit, y_pred)
+    except Exception:
+        mu_f, sig_f, r2 = anchor, _nan, _nan
+
+    return dict(mu_fit=float(mu_f), sigma_fit=float(abs(sig_f)),
+                n_used=int(fit_mask.sum()), r2=float(r2) if np.isfinite(r2) else _nan,
+                bin_centers=bin_centers, counts=counts, fit_mask=fit_mask,
+                mode_kde=mode_kde)
+
 
 def estimate_psf_from_beads(
     tif_path,
@@ -628,8 +964,10 @@ def estimate_psf_from_beads(
     sigma_z_bounds=(0.05, 1.00),
     dog_sigma_small_um=0.08,
     dog_sigma_large_um=0.50,
-    max_center_offset_px=3,
-    best_fraction=0.5,
+    margin_px=2,
+    r2_threshold=0.9,
+    reporting_mode='averaged_psf',   # str or list[str]
+    diagnostic_histogram_fit=False,
     save_path=None,
     verbose=True,
     progress_callback=None,
@@ -645,6 +983,37 @@ def estimate_psf_from_beads(
     """
     Estimate the experimental PSF by averaging isolated sub-diffraction beads.
 
+    Filter stack (applied after per-bead Gaussian fit)
+    ---------------------------------------------------
+    1. Edge     — discard beads within (ROI_half + margin_px) of the border.
+    2. Isolation — discard beads whose nearest neighbour is closer than
+                   min_sep_um (3D Euclidean distance in µm).
+    3. Fit       — discard beads where the Gaussian fit failed to converge.
+    4. Amplitude — MAD outlier filter on fitted bead amplitude.
+    5. R²        — discard beads with Gaussian fit quality R² < r2_threshold.
+    6. Sanity   — discard beads with unphysical fit parameters (centre
+                   displacement, background, sigma at constraint wall).
+
+    Log: "Beads: detected=N0 → edge=N1 → isolation=N2 → fit_ok=N2b →
+          amplitude=N3 → r²=N4 → sanity=N5"
+
+    FWHM reporting
+    --------------
+    reporting_mode='averaged_psf' (default):
+        Headline = FWHM of the averaged PSF measured from its central 1-D
+        profiles (no Gaussian assumption, see measure_fwhm_from_averaged_psf).
+        Per-bead mean ± SD and median ± MAD are always logged as context.
+        Equivalent to PSFj / Huygens averaged-PSF approach.
+    reporting_mode='per_bead_mean':
+        Headline = mean(per-bead FWHMs) ± SD.
+        Equivalent to Sapoznik et al. eLife 2020.
+    reporting_mode='per_bead_median':
+        Headline = median(per-bead FWHMs) ± MAD.
+        Equivalent to dOPM and PSFj per-bead median style.
+
+    All three estimators are computed regardless of reporting_mode and stored
+    in bead_data['fwhm_axes'] for downstream comparison.
+
     Parameters
     ----------
     tif_path : str
@@ -652,105 +1021,43 @@ def estimate_psf_from_beads(
     dx : float
         Lateral (XY) pixel size in µm.
     dz : float
-        Axial (Z) voxel size in µm for the deskewed volume.
-        For the OPM system: dz = galvo_step_um × sin(tilt_deg) ≈ 0.110 µm.
+        Axial (Z) voxel size in µm.
     threshold : float or None
-        Absolute threshold on the DoG image for candidate detection.
-        None (default) → automatic: mean + 5·std of positive DoG values.
+        DoG threshold.  None → automatic (mean + 5·std of positive DoG).
     min_sep_um : float
-        Minimum centre-to-centre separation between beads [µm].
-        Converted to an anisotropic ellipsoidal footprint for peak_local_max.
-    roi_um : tuple of float (rz, ry, rx)
-        ROI half-size in µm per axis.  Each axis is rounded to an odd pixel count.
-    sigma_xy_bounds : tuple (min_um, max_um)
-        Acceptable range for the fitted lateral sigma [µm].
-        Typical values for NA ≈ 1.1 at 488 / 561 nm: (0.05, 0.60).
-    sigma_z_bounds : tuple (min_um, max_um)
-        Acceptable range for the fitted axial sigma [µm].
-    dog_sigma_small_um : float
-        Small DoG sigma [µm]. Must be smaller than the expected bead sigma.
-    dog_sigma_large_um : float
-        Large DoG sigma [µm]. Must be larger than the expected bead sigma.
-    max_center_offset_px : int
-        Maximum allowed distance (in pixels) between the intensity peak and the
-        geometric ROI centre.  Rejects beads drifted toward the ROI edge.
-    best_fraction : float  (0 < x ≤ 1)
-        Fraction of beads to retain for the final average, selected by
-        ascending lateral sigma (sharpest first).
-        0.5 → keep the best 50%;  1.0 → use all accepted beads.
-    save_path : str or None
-        Output TIFF path.  Default: <tif_path without extension>_psf.tif
-    verbose : bool
-        Print progress and summary statistics to stdout.
-    progress_callback : callable(fraction: float, message: str) or None
-        Called periodically with a progress fraction in [0, 1] and a short
-        status string.  Intended for updating a GUI progress bar.
-    return_bead_data : bool
-        If True, return (psf, save_path, bead_data) instead of (psf, save_path).
-        bead_data contains per-bead positions and fitted sigma values.
-    fit_mode : {'1d', '3d'}
-        '1d' (default) — sequential 1-D Gaussian fits along Z, Y, X axes.
-             Fast and robust for beads with a roughly symmetric PSF.
-        '3d' — simultaneous 3-D Gaussian fit to the full ROI volume.
-             More accurate for asymmetric PSFs but ~10–100× slower per bead.
-    n_jobs : int
-        Number of parallel worker threads for the bead quality-check loop.
-        1 (default) — sequential, zero threading overhead.
-        -1           — use all logical CPU cores (os.cpu_count()).
-        N > 1        — use exactly N threads.
-        Threads share the volume array without copying.  SciPy and NumPy
-        release the GIL during their C extensions, so speedup is real on
-        multi-core machines.  Most useful when fit_mode='3d'.
-    compare_theoretical : bool
-        If True, generate a theoretical PSF with psfmodels and compute
-        similarity metrics against the empirical PSF.  Requires psfmodels
-        (pip install "psfscope[theory]") and the na/wavelength_um parameters.
-    na : float or None
-        Objective numerical aperture.  Required when compare_theoretical=True.
-    wavelength_um : float or None
-        Fluorophore emission wavelength [µm] (e.g. 0.515 for 515 nm).
-        Required when compare_theoretical=True.
-    ni : float
-        Refractive index of the immersion medium (default 1.333, water).
-        Used only when compare_theoretical=True.
-    psf_model : {'vectorial', 'scalar'}
-        Theoretical PSF model to use via psfmodels.
-        'vectorial' (default) — Richards-Wolf vectorial model.
-        'scalar'              — Gibson-Lanni scalar model.
+        Minimum bead separation [µm].
+    roi_um : tuple (rz, ry, rx)  — ROI half-size in µm per axis.
+    sigma_xy_bounds : tuple (min, max) [µm] — curve_fit lateral sigma bounds.
+    sigma_z_bounds  : tuple (min, max) [µm] — curve_fit axial sigma bounds.
+    dog_sigma_small_um, dog_sigma_large_um : float
+    margin_px : int
+        Extra border margin beyond the ROI half-size (default 2).
+    r2_threshold : float
+        Minimum Gaussian fit R² to accept a bead (default 0.9).
+    reporting_mode : {'averaged_psf', 'per_bead_mean', 'per_bead_median'}
+        Controls which FWHM estimator is shown as the headline result.
+    diagnostic_histogram_fit : bool
+        If True, also runs _fit_psf_from_histogram_diagnostic on each axis and
+        stores the result in bead_data['fwhm_axes'][axis]['_diagnostic_histogram_fit_nm'].
+        Logged with a warning; not used for reporting.
+    save_path, verbose, progress_callback, return_bead_data,
+    fit_mode, n_jobs, compare_theoretical, na, wavelength_um, ni, psf_model
+        Same as before.
 
     Returns
     -------
-    psf : np.ndarray, float32, shape (Nz, Ny, Nx)
-        Normalised PSF: psf.sum() == 1.  Ready for use in
-        postprocess_deconvolution.deconvolve_volume().
+    psf : ndarray, float32  — normalised PSF (sum = 1)
     save_path : str
-        Path where the PSF TIFF was saved.
     bead_data : dict  (only when return_bead_data=True)
-        Keys
-        ----
-        volume_shape        (nz, ny, nx) in pixels
-        dx, dz              voxel sizes in µm
-        candidates_px       all peak_local_max detections, shape (N, 3) [z, y, x]
-        border_px           border-rejected candidates, shape (M, 3)
-        rejected_px         quality-rejected candidates, shape (K, 3)
-        accepted_px         quality-passed candidates (before best_fraction), shape (J, 3)
-        accepted_sigma_z    fitted σ_z  [µm], shape (J,)
-        accepted_sigma_y    fitted σ_y  [µm], shape (J,)
-        accepted_sigma_x    fitted σ_x  [µm], shape (J,)
-        accepted_sigma_xy      mean of σ_y and σ_x [µm], shape (J,)
-        accepted_ellipticity   (σ_x - σ_y) / σ_xy [-], shape (J,)
-                               0 = circular, >0 = x-elongated, <0 = y-elongated
-        accepted_snr           peak-above-bg / std(ROI outer shell) [-], shape (J,)
-        accepted_used          bool mask (J,): True = included in the final PSF
-        n_total             total candidates detected
-        n_border            candidates rejected for being too close to the border
-        n_quality_rejected  candidates rejected by the quality filter
-        n_accepted          beads that passed quality (len of accepted_* arrays)
-        n_used              beads included in the final average
-        psf_theoretical     normalised theoretical PSF, shape (Nz, Ny, Nx), or None
-        psf_mse             mean squared error vs theoretical PSF, or None
-        psf_ncc             normalised cross-correlation vs theoretical PSF, or None
-        psf_pearson_r       Pearson r vs theoretical PSF, or None
+        fwhm_averaged_psf_z/y/x   float [nm] — FWHM of averaged PSF
+        fwhm_per_bead_mean_z/y/x  float [nm] — mean of per-bead FWHMs
+        fwhm_per_bead_sd_z/y/x    float [nm] — SD of per-bead FWHMs
+        fwhm_median_z/y/x         float [nm] — median of per-bead FWHMs
+        fwhm_mad_z/y/x            float [nm] — MAD of per-bead FWHMs
+        fwhm_axes                 dict — JSON-ready nested structure per axis
+        reporting_mode            str
+        n_edge, n_isolation, n_fit_ok, n_fit_failed,
+        n_amplitude, n_r2, n_sanity  — filter stage counts
     """
     def _cb(frac, msg):
         if progress_callback is not None:
@@ -793,11 +1100,9 @@ def estimate_psf_from_beads(
     )
     rz, ry, rx = roi_shape[0] // 2, roi_shape[1] // 2, roi_shape[2] // 2
     if verbose:
-        print(f"[PSF] ROI: {roi_shape} px  ({roi_um[0]:.2f} × {roi_um[1]:.2f} × {roi_um[2]:.2f} µm)")
+        print(f"[PSF] ROI: {roi_shape} px  ({roi_um[0]:.2f}×{roi_um[1]:.2f}×{roi_um[2]:.2f} µm)")
 
-    # --- Anisotropic ellipsoidal footprint for peak detection ---
-    # Converts min_sep_um to per-axis pixel counts and builds an ellipsoid mask.
-    # This correctly handles dz ≠ dx (inspired by QI2lab/localize-psf).
+    # --- Anisotropic ellipsoidal footprint for NMS detection ---
     z_sep_px  = max(1, int(np.ceil(min_sep_um / dz)))
     xy_sep_px = max(1, int(np.ceil(min_sep_um / dx)))
     zz, yy, xx = np.ogrid[
@@ -805,60 +1110,53 @@ def estimate_psf_from_beads(
         -xy_sep_px : xy_sep_px + 1,
         -xy_sep_px : xy_sep_px + 1,
     ]
-    footprint = ((zz / z_sep_px) ** 2 + (yy / xy_sep_px) ** 2 + (xx / xy_sep_px) ** 2) <= 1.0
+    footprint = (
+        (zz / z_sep_px) ** 2 + (yy / xy_sep_px) ** 2 + (xx / xy_sep_px) ** 2
+    ) <= 1.0
 
-    # --- Candidate detection ---
+    # --- Candidate detection (N0) ---
     candidates = peak_local_max(
-        dog,
-        footprint=footprint,
-        threshold_abs=threshold,
-        exclude_border=True,
+        dog, footprint=footprint, threshold_abs=threshold, exclude_border=True,
     )
+    n0 = len(candidates)
     if verbose:
-        print(f"[PSF] Candidates detected: {len(candidates)}")
-    _cb(0.20, f"{len(candidates)} candidates detected")
+        print(f"[PSF] Candidates detected: {n0}")
+    _cb(0.18, f"{n0} candidates detected")
 
-    # --- ROI extraction and quality filtering ---
     nz, ny, nx = volume.shape
-    valid_rois       = []
-    offsets_list     = []
-    # Full lists (all accepted beads, before best_fraction filtering)
-    all_sigma_z        = []
-    all_sigma_y        = []
-    all_sigma_x        = []
-    all_sigma_xy       = []
-    all_ellipticity    = []   # (σ_x - σ_y) / σ_xy  — lateral asymmetry
-    all_snr            = []   # peak-signal / std(outer-shell background)
-    all_accepted_pos   = []
-    # Lists for bead_data
-    border_list      = []
-    rejected_list    = []
-    n_border, n_quality = 0, 0
 
-    n_cand   = len(candidates)
+    # --- Filter 1: Edge (pre-fit, cheap) ---
+    edge_surv = _filter_edge(candidates, volume.shape, rz, ry, rx, margin_px)
+    n1        = len(edge_surv)
+    border_px = candidates[~np.isin(np.arange(n0),
+                                     np.where(np.all(candidates[:, None] ==
+                                                      edge_surv[None], axis=2).any(axis=1))[0])]
+
+    # --- Filter 2: Isolation (pre-fit, uses only peak positions) ---
+    iso_idx  = _filter_isolation(edge_surv, min_sep_um, dx, dz)
+    iso_surv = edge_surv[iso_idx]
+    n2       = len(iso_surv)
+    _cb(0.20, f"Edge: {n1}  Isolation: {n2}")
+
+    # --- Fit loop on isolation survivors ---
+    n_cand    = n2
     n_workers = (os.cpu_count() or 1) if n_jobs == -1 else max(1, n_jobs)
 
-    # Closure that binds all per-run constants; only (cz, cy, cx) varies.
-    # volume is read-only → thread-safe for concurrent NumPy slicing.
     def _worker(czyx):
         cz, cy, cx = int(czyx[0]), int(czyx[1]), int(czyx[2])
         return _process_one_bead(
             cz, cy, cx, volume, nz, ny, nx, rz, ry, rx,
-            dx, dz, sigma_xy_bounds, sigma_z_bounds,
-            max_center_offset_px, fit_mode,
+            dx, dz, sigma_xy_bounds, sigma_z_bounds, fit_mode,
         )
 
     if n_workers == 1:
-        # Sequential path: per-bead progress updates, zero threading overhead.
         raw_results = []
-        for i, czyx in enumerate(candidates):
+        for i, czyx in enumerate(iso_surv):
             if i % max(1, n_cand // 20) == 0:
-                _cb(0.20 + 0.60 * i / max(n_cand, 1),
-                    f"Checking bead {i+1}/{n_cand} ...")
+                _cb(0.20 + 0.55 * i / max(n_cand, 1),
+                    f"Fitting bead {i+1}/{n_cand} ...")
             raw_results.append(_worker(czyx))
     else:
-        # Parallel path: ThreadPoolExecutor shares volume without copying.
-        # SciPy/NumPy release the GIL, enabling real multi-core throughput.
         _done = [0]
         _lock = threading.Lock()
 
@@ -868,120 +1166,143 @@ def estimate_psf_from_beads(
                 _done[0] += 1
                 d = _done[0]
             if d % max(1, n_cand // 20) == 0 or d == n_cand:
-                _cb(0.20 + 0.60 * d / max(n_cand, 1),
-                    f"Checked {d}/{n_cand} candidates ...")
+                _cb(0.20 + 0.55 * d / max(n_cand, 1),
+                    f"Fitted {d}/{n_cand} ...")
             return result
 
         if verbose:
             print(f"[PSF] Parallel bead processing: {n_workers} threads")
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            raw_results = list(executor.map(_worker_tracked, candidates))
+            raw_results = list(executor.map(_worker_tracked, iso_surv))
 
-    # Unpack results — order preserved by both sequential and parallel paths.
-    for r in raw_results:
-        if r['status'] == 'border':
-            n_border += 1
-            border_list.append(r['pos'])
-        elif r['status'] == 'rejected':
-            n_quality += 1
-            rejected_list.append(r['pos'])
-        else:  # accepted
-            roi      = r['roi']
-            sz, sy, sx = r['sz'], r['sy'], r['sx']
-            sxy_mean = (sy + sx) / 2.0
-            valid_rois.append(roi)
-            offsets_list.append(r['offset_px'])
-            all_sigma_z.append(sz)
-            all_sigma_y.append(sy)
-            all_sigma_x.append(sx)
-            all_sigma_xy.append(sxy_mean)
-            all_ellipticity.append((sx - sy) / sxy_mean if sxy_mean > 0 else 0.0)
-            all_snr.append(r['snr'])
-            all_accepted_pos.append(r['pos'])
+    fit_ok_list   = [r for r in raw_results if r['status'] == 'fit_ok']
+    fit_fail_list = [r for r in raw_results if r['status'] == 'fit_failed']
+    n2b = len(fit_ok_list)
 
+    # --- Filter 3: Amplitude (MAD) ---
+    amp_idx  = _filter_amplitude(fit_ok_list)
+    amp_surv = [fit_ok_list[i] for i in amp_idx]
+    n3       = len(amp_surv)
+
+    # --- Filter 4: R² ---
+    r2_idx   = _filter_r2(amp_surv, r2_threshold)
+    r2_surv  = [amp_surv[i] for i in r2_idx]
+    n4       = len(r2_surv)
+
+    # --- Filter 5: Sanity ---
+    san_idx     = _filter_sanity(r2_surv, sigma_xy_bounds, sigma_z_bounds)
+    final_beads = [r2_surv[i] for i in san_idx]
+    n5          = len(final_beads)
+
+    filter_log = (f"Beads: detected={n0} → edge={n1} → isolation={n2} → "
+                  f"fit_ok={n2b} → amplitude={n3} → r²={n4} → sanity={n5}")
     if verbose:
-        print(f"[PSF] Rejected (border):  {n_border}")
-        print(f"[PSF] Rejected (quality): {n_quality}")
-        print(f"[PSF] Accepted beads:     {len(valid_rois)}")
-    _cb(0.82, f"{len(valid_rois)} beads accepted  (border: {n_border}, quality: {n_quality})")
+        print(f"[PSF] {filter_log}")
+    _cb(0.78, filter_log)
 
-    if len(valid_rois) == 0:
+    if n5 == 0:
         raise RuntimeError(
-            "No valid beads found. Try:\n"
+            "No valid beads after filtering. Try:\n"
             "  - Lowering 'threshold' (or set to None for automatic)\n"
+            "  - Reducing 'min_sep_um' or 'margin_px'\n"
+            "  - Lowering 'r2_threshold'\n"
             "  - Widening 'sigma_xy_bounds' / 'sigma_z_bounds'\n"
-            "  - Verifying that the input is a deskewed bead volume\n"
-            "  - Increasing 'roi_um' if the beads appear large"
+            "  - Verifying the input is a deskewed bead volume"
         )
 
-    # --- Best-fraction selection by lateral sigma ---
-    # Compute used_mask BEFORE filtering so bead_data includes all accepted beads.
-    used_mask = np.ones(len(valid_rois), dtype=bool)
+    # --- Per-bead FWHM statistics ---
+    k = 2.355 * 1000   # σ → FWHM in nm
+    fwhm_z_nm = np.array([b['sz'] * k for b in final_beads])
+    fwhm_y_nm = np.array([b['sy'] * k for b in final_beads])
+    fwhm_x_nm = np.array([b['sx'] * k for b in final_beads])
 
-    sigma_z_list  = list(all_sigma_z)
-    sigma_y_list  = list(all_sigma_y)
-    sigma_x_list  = list(all_sigma_x)
-    sigma_xy_list = list(all_sigma_xy)
+    def _mad(v):
+        a = np.asarray(v)
+        return float(np.median(np.abs(a - np.median(a))))
 
-    if 0.0 < best_fraction < 1.0 and len(valid_rois) > 1:
-        cutoff = np.percentile(sigma_xy_list, best_fraction * 100)
-        keep   = [i for i, s in enumerate(sigma_xy_list) if s <= cutoff]
-        if len(keep) > 0:
-            used_mask           = np.zeros(len(valid_rois), dtype=bool)
-            used_mask[keep]     = True
-            valid_rois_filt     = [valid_rois[i]   for i in keep]
-            offsets_list_filt   = [offsets_list[i] for i in keep]
-            sigma_z_list        = [all_sigma_z[i]  for i in keep]
-            sigma_y_list        = [all_sigma_y[i]  for i in keep]
-            sigma_x_list        = [all_sigma_x[i]  for i in keep]
-            sigma_xy_list       = [all_sigma_xy[i] for i in keep]
-            if verbose:
-                print(f"[PSF] After selection (best {best_fraction*100:.0f}%): "
-                      f"{len(valid_rois_filt)} beads")
-        else:
-            valid_rois_filt   = valid_rois
-            offsets_list_filt = offsets_list
-    else:
-        valid_rois_filt   = valid_rois
-        offsets_list_filt = offsets_list
-
-    _cb(0.86, f"Selection: {used_mask.sum()} beads used in PSF")
-
-    if verbose:
-        sz_mean  = np.mean(sigma_z_list)
-        sy_mean  = np.mean(sigma_y_list)
-        sx_mean  = np.mean(sigma_x_list)
-        sxy_mean = np.mean(sigma_xy_list)
-        n_beads  = len(sigma_z_list)
-        sqn      = np.sqrt(n_beads)
-        sz_sd  = np.std(sigma_z_list);  sz_sem  = sz_sd  / sqn
-        sy_sd  = np.std(sigma_y_list);  sy_sem  = sy_sd  / sqn
-        sx_sd  = np.std(sigma_x_list);  sx_sem  = sx_sd  / sqn
-        sxy_sd = np.std(sigma_xy_list); sxy_sem = sxy_sd / sqn
-        k = 2.355 * 1000  # σ → FWHM in nm
-        print(f"[PSF] N = {n_beads} beads")
-        print(f"[PSF] σ_z  : {sz_mean:.3f} ± {sz_sd:.3f} µm (SD)  →  FWHM_z  ≈ {sz_mean*k:.0f} ± {sz_sd*k:.0f} nm (SD,  SEM={sz_sem*k:.0f} nm)")
-        print(f"[PSF] σ_y  : {sy_mean:.3f} ± {sy_sd:.3f} µm (SD)  →  FWHM_y  ≈ {sy_mean*k:.0f} ± {sy_sd*k:.0f} nm (SD,  SEM={sy_sem*k:.0f} nm)")
-        print(f"[PSF] σ_x  : {sx_mean:.3f} ± {sx_sd:.3f} µm (SD)  →  FWHM_x  ≈ {sx_mean*k:.0f} ± {sx_sd*k:.0f} nm (SD,  SEM={sx_sem*k:.0f} nm)")
-        print(f"[PSF] σ_xy : {sxy_mean:.3f} ± {sxy_sd:.3f} µm (SD)  →  FWHM_xy ≈ {sxy_mean*k:.0f} ± {sxy_sd*k:.0f} nm (SD,  SEM={sxy_sem*k:.0f} nm)")
+    mean_z, sd_z = float(np.mean(fwhm_z_nm)), float(np.std(fwhm_z_nm))
+    mean_y, sd_y = float(np.mean(fwhm_y_nm)), float(np.std(fwhm_y_nm))
+    mean_x, sd_x = float(np.mean(fwhm_x_nm)), float(np.std(fwhm_x_nm))
+    med_z,  mad_z = float(np.median(fwhm_z_nm)), _mad(fwhm_z_nm)
+    med_y,  mad_y = float(np.median(fwhm_y_nm)), _mad(fwhm_y_nm)
+    med_x,  mad_x = float(np.median(fwhm_x_nm)), _mad(fwhm_x_nm)
 
     # --- Sub-pixel alignment and averaging ---
-    _cb(0.88, "Averaging beads ...")
-    psf = _center_and_average(valid_rois_filt, offsets_list_filt)
+    _cb(0.80, "Averaging beads ...")
+    valid_rois   = [b['roi']       for b in final_beads]
+    offsets_list = [b['offset_px'] for b in final_beads]
+    psf = _center_and_average(valid_rois, offsets_list)
 
-    # --- Normalise (min = 0, sum = 1) ---
+    # --- Normalise ---
     psf -= np.nanmin(psf)
     total = np.nansum(psf)
     if total > 0:
         psf /= total
     psf = np.nan_to_num(psf, nan=0.0).astype(np.float32)
-    _cb(0.95, "PSF normalised")
+    _cb(0.87, "PSF normalised — measuring FWHM ...")
 
-    # --- Theoretical PSF comparison (optional, requires psfmodels) ---
+    # --- FWHM of averaged PSF (non-parametric, no Gaussian assumption) ---
+    avg_fwhm = measure_fwhm_from_averaged_psf(psf, (dz * 1000.0, dx * 1000.0, dx * 1000.0))
+    avg_z = avg_fwhm['fwhm_z_nm']
+    avg_y = avg_fwhm['fwhm_y_nm']
+    avg_x = avg_fwhm['fwhm_x_nm']
+
+    # Normalise reporting_mode to a list so callers can pass a str or a list
+    _modes = [reporting_mode] if isinstance(reporting_mode, str) else list(reporting_mode)
+    _valid = {'averaged_psf', 'per_bead_mean', 'per_bead_median'}
+    for _m in _modes:
+        if _m not in _valid:
+            raise ValueError(f"Unknown reporting_mode '{_m}'. Valid: {_valid}")
+
+    if verbose:
+        print(f"[PSF] N = {n5} beads used in PSF")
+        for axis, avg_nm, mn, sd, med, mad in [
+            ('z', avg_z, mean_z, sd_z, med_z, mad_z),
+            ('y', avg_y, mean_y, sd_y, med_y, mad_y),
+            ('x', avg_x, mean_x, sd_x, med_x, mad_x),
+        ]:
+            avg_str = f"{avg_nm:.0f}" if np.isfinite(avg_nm) else "?"
+            if len(_modes) == 1:
+                mode = _modes[0]
+                if mode == 'averaged_psf':
+                    line = (f"[PSF] FWHM_{axis} = {avg_str} nm (avg-PSF)   "
+                            f"per-bead: mean={mn:.0f}±{sd:.0f} SD, "
+                            f"median={med:.0f} ±{mad:.0f} MAD, N={n5}")
+                elif mode == 'per_bead_mean':
+                    line = (f"[PSF] FWHM_{axis} = {mn:.0f} ± {sd:.0f} nm "
+                            f"(mean ± SD per-bead, N={n5})   avg-PSF: {avg_str} nm")
+                else:  # per_bead_median
+                    line = (f"[PSF] FWHM_{axis} = {med:.0f} ± {mad:.0f} nm "
+                            f"(median ± MAD per-bead, N={n5})   avg-PSF: {avg_str} nm")
+            else:
+                parts = []
+                if 'averaged_psf'    in _modes: parts.append(f"avg-PSF={avg_str}")
+                if 'per_bead_mean'   in _modes: parts.append(f"mean±SD={mn:.0f}±{sd:.0f}")
+                if 'per_bead_median' in _modes: parts.append(f"median±MAD={med:.0f}±{mad:.0f}")
+                line = f"[PSF] FWHM_{axis}   {'   '.join(parts)}   nm   (N={n5})"
+            print(line)
+
+    if diagnostic_histogram_fit:
+        if verbose:
+            print("[PSF] ⚠ Diagnostic histogram fits (not used for reporting):")
+        _diag_hist = {}
+        for axis, fwhm_nm in [('z', fwhm_z_nm), ('y', fwhm_y_nm), ('x', fwhm_x_nm)]:
+            hd = _fit_psf_from_histogram_diagnostic(fwhm_nm)
+            _diag_hist[axis] = hd
+            if verbose:
+                r2_str = f"{hd['r2']:.3f}" if np.isfinite(hd.get('r2', float('nan'))) else "?"
+                print(f"[PSF]   FWHM_{axis} histogram mode = {hd['mu_fit']:.0f} nm  "
+                      f"(R²={r2_str}, diagnostic only)")
+    else:
+        _diag_hist = {}
+
+    _cb(0.93, "FWHM measured")
+
+    # --- Theoretical PSF comparison (optional) ---
     if compare_theoretical:
         if na is None or wavelength_um is None:
             raise ValueError(
-                "compare_theoretical=True requires 'na' and 'wavelength_um' to be specified."
+                "compare_theoretical=True requires 'na' and 'wavelength_um'."
             )
         try:
             psf_theory = _theoretical_psf(
@@ -990,13 +1311,12 @@ def estimate_psf_from_beads(
             metrics = _psf_comparison_metrics(psf.astype(float), psf_theory)
             if verbose:
                 print(f"[PSF] Theory vs empirical  (model: {psf_model}):")
-                print(f"[PSF]   MSE       = {metrics['mse']:.6f}")
-                print(f"[PSF]   NCC       = {metrics['ncc']:.4f}")
-                print(f"[PSF]   Pearson r = {metrics['pearson_r']:.4f}")
-            _cb(0.97, f"Theory comparison: NCC={metrics['ncc']:.3f}  MSE={metrics['mse']:.2e}")
+                print(f"[PSF]   MSE={metrics['mse']:.6f}  "
+                      f"NCC={metrics['ncc']:.4f}  r={metrics['pearson_r']:.4f}")
+            _cb(0.97, f"Theory NCC={metrics['ncc']:.3f}  MSE={metrics['mse']:.2e}")
         except Exception as exc:
             if verbose:
-                print(f"[PSF] Warning: theoretical PSF comparison failed: {exc}")
+                print(f"[PSF] Warning: theory comparison failed: {exc}")
             psf_theory = None
             metrics    = {'mse': None, 'ncc': None, 'pearson_r': None}
     else:
@@ -1005,9 +1325,7 @@ def estimate_psf_from_beads(
 
     # --- Save ---
     if save_path is None:
-        base      = os.path.splitext(tif_path)[0]
-        save_path = base + '_psf.tif'
-
+        save_path = os.path.splitext(tif_path)[0] + '_psf.tif'
     imwrite(save_path, psf, imagej=True, metadata={'axes': 'ZYX'})
     if verbose:
         print(f"[PSF] Saved: {save_path}  shape={psf.shape}")
@@ -1017,33 +1335,113 @@ def estimate_psf_from_beads(
         return psf, save_path
 
     # --- Build bead_data ---
+    # accepted_* arrays cover all fit_ok beads (n2b); accepted_used marks the n5 final ones.
+    all_sigma_z      = [b['sz']  for b in fit_ok_list]
+    all_sigma_y      = [b['sy']  for b in fit_ok_list]
+    all_sigma_x      = [b['sx']  for b in fit_ok_list]
+    all_sigma_xy     = [(b['sy'] + b['sx']) / 2.0 for b in fit_ok_list]
+    all_ellipticity  = [((b['sx'] - b['sy']) / ((b['sy'] + b['sx']) / 2.0)
+                          if (b['sy'] + b['sx']) > 0 else 0.0)
+                         for b in fit_ok_list]
+    all_snr          = [b['snr'] for b in fit_ok_list]
+    all_accepted_pos = [b['pos'] for b in fit_ok_list]
+
+    final_set   = set(id(b) for b in final_beads)
+    used_mask   = np.array([id(b) in final_set for b in fit_ok_list], dtype=bool)
+
     acc_px = (np.array(all_accepted_pos, dtype=int).reshape(-1, 3)
               if all_accepted_pos else np.empty((0, 3), dtype=int))
+
+    # Rejected positions: fit_failed + all post-fit filter rejects
+    rejected_pos = [r['pos'] for r in fit_fail_list]
+    for b in fit_ok_list:
+        if id(b) not in final_set:
+            rejected_pos.append(b['pos'])
+
+    # Border positions: candidates that failed the edge filter
+    edge_set     = set(map(tuple, edge_surv.tolist()))
+    border_pos   = [tuple(c) for c in candidates.tolist() if tuple(c) not in edge_set]
+
+    def _px_arr(lst):
+        return (np.array(lst, dtype=int).reshape(-1, 3)
+                if lst else np.empty((0, 3), dtype=int))
+
     bead_data = {
-        'volume_shape':       volume.shape,
-        'dx':                 dx,
-        'dz':                 dz,
-        'roi_shape':          roi_shape,
-        'candidates_px':      candidates,
-        'border_px':          np.array(border_list,   dtype=int).reshape(-1, 3),
-        'rejected_px':        np.array(rejected_list, dtype=int).reshape(-1, 3),
-        'accepted_px':        acc_px,
-        'accepted_sigma_z':      np.array(all_sigma_z),
-        'accepted_sigma_y':      np.array(all_sigma_y),
-        'accepted_sigma_x':      np.array(all_sigma_x),
-        'accepted_sigma_xy':     np.array(all_sigma_xy),
-        'accepted_ellipticity':  np.array(all_ellipticity),
-        'accepted_snr':          np.array(all_snr),
-        'accepted_used':      used_mask,
-        'n_total':            len(candidates),
-        'n_border':           n_border,
-        'n_quality_rejected': n_quality,
-        'n_accepted':         len(all_accepted_pos),
-        'n_used':             int(used_mask.sum()),
-        'psf_theoretical':    psf_theory,
-        'psf_mse':            metrics['mse'],
-        'psf_ncc':            metrics['ncc'],
-        'psf_pearson_r':      metrics['pearson_r'],
+        # Geometry
+        'volume_shape': volume.shape,
+        'dx': dx, 'dz': dz, 'roi_shape': roi_shape,
+        # Detection
+        'candidates_px': candidates,
+        'border_px':     _px_arr(border_pos),
+        'rejected_px':   _px_arr(rejected_pos),
+        # Per-bead arrays (all fit_ok beads, n2b)
+        'accepted_px':         acc_px,
+        'accepted_sigma_z':    np.array(all_sigma_z),
+        'accepted_sigma_y':    np.array(all_sigma_y),
+        'accepted_sigma_x':    np.array(all_sigma_x),
+        'accepted_sigma_xy':   np.array(all_sigma_xy),
+        'accepted_ellipticity':np.array(all_ellipticity),
+        'accepted_snr':        np.array(all_snr),
+        'accepted_used':       used_mask,
+        # Filter-stage counts
+        'n_total':        n0,
+        'n_edge':         n1,
+        'n_border':       n0 - n1,
+        'n_isolation':    n2,
+        'n_fit_failed':   len(fit_fail_list),
+        'n_fit_ok':       n2b,
+        'n_amplitude':    n3,
+        'n_r2':           n4,
+        'n_sanity':       n5,
+        'n_quality_rejected': (n0 - n1) + (n1 - n2) + len(fit_fail_list),
+        'n_accepted':     n2b,
+        'n_used':         n5,
+        # FWHM reporting — per-bead statistics
+        'fwhm_per_bead_mean_z': mean_z, 'fwhm_per_bead_mean_y': mean_y, 'fwhm_per_bead_mean_x': mean_x,
+        'fwhm_per_bead_sd_z':   sd_z,   'fwhm_per_bead_sd_y':   sd_y,   'fwhm_per_bead_sd_x':   sd_x,
+        'fwhm_median_z': med_z, 'fwhm_median_y': med_y, 'fwhm_median_x': med_x,
+        'fwhm_mad_z':    mad_z, 'fwhm_mad_y':    mad_y, 'fwhm_mad_x':    mad_x,
+        # FWHM reporting — averaged PSF (non-parametric)
+        'fwhm_averaged_psf_z': avg_z, 'fwhm_averaged_psf_y': avg_y, 'fwhm_averaged_psf_x': avg_x,
+        # JSON-ready combined structure (all estimators, independent of reporting_mode)
+        'fwhm_axes': {
+            'axis_z': {
+                'fwhm_averaged_psf_nm':    round(avg_z,  1) if np.isfinite(avg_z)  else None,
+                'fwhm_per_bead_mean_nm':   round(mean_z, 1),
+                'fwhm_per_bead_sd_nm':     round(sd_z,   1),
+                'fwhm_per_bead_median_nm': round(med_z,  1),
+                'fwhm_per_bead_mad_nm':    round(mad_z,  1),
+                'n_beads_used': n5, 'fit_mode': fit_mode.upper(),
+                **({'_diagnostic_histogram_fit_nm': round(_diag_hist['z']['mu_fit'], 1)}
+                   if _diag_hist.get('z') else {}),
+            },
+            'axis_y': {
+                'fwhm_averaged_psf_nm':    round(avg_y,  1) if np.isfinite(avg_y)  else None,
+                'fwhm_per_bead_mean_nm':   round(mean_y, 1),
+                'fwhm_per_bead_sd_nm':     round(sd_y,   1),
+                'fwhm_per_bead_median_nm': round(med_y,  1),
+                'fwhm_per_bead_mad_nm':    round(mad_y,  1),
+                'n_beads_used': n5, 'fit_mode': fit_mode.upper(),
+                **({'_diagnostic_histogram_fit_nm': round(_diag_hist['y']['mu_fit'], 1)}
+                   if _diag_hist.get('y') else {}),
+            },
+            'axis_x': {
+                'fwhm_averaged_psf_nm':    round(avg_x,  1) if np.isfinite(avg_x)  else None,
+                'fwhm_per_bead_mean_nm':   round(mean_x, 1),
+                'fwhm_per_bead_sd_nm':     round(sd_x,   1),
+                'fwhm_per_bead_median_nm': round(med_x,  1),
+                'fwhm_per_bead_mad_nm':    round(mad_x,  1),
+                'n_beads_used': n5, 'fit_mode': fit_mode.upper(),
+                **({'_diagnostic_histogram_fit_nm': round(_diag_hist['x']['mu_fit'], 1)}
+                   if _diag_hist.get('x') else {}),
+            },
+        },
+        'reporting_mode': ','.join(_modes),
+        # Theoretical
+        'psf_theoretical': psf_theory,
+        'psf_mse':         metrics['mse'],
+        'psf_ncc':         metrics['ncc'],
+        'psf_pearson_r':   metrics['pearson_r'],
     }
     return psf, save_path, bead_data
 
@@ -1080,9 +1478,22 @@ def _parse_args():
     p.add_argument("--sigma-z",       type=float, nargs=2, default=[0.05, 1.00],
                    metavar=("MIN", "MAX"),
                    help="Acceptable σ_z range [µm]")
-    p.add_argument("--best-fraction", type=float, default=0.5,
-                   help="Fraction of beads to use (lowest σ_xy). "
-                        "1.0 = all, 0.5 = best 50%%")
+    p.add_argument("--margin-px",      type=int,   default=2,
+                   help="Minimum margin in pixels between a bead ROI and the "
+                        "volume edge (edge filter).")
+    p.add_argument("--r2-threshold",  type=float, default=0.9,
+                   help="Minimum R² for accepting a Gaussian fit (R² filter).")
+    p.add_argument("--reporting-mode", type=str, nargs='+',
+                   default=["averaged_psf"],
+                   choices=["averaged_psf", "per_bead_mean", "per_bead_median"],
+                   metavar="MODE",
+                   help="One or more FWHM reporting modes (space-separated). "
+                        "Choices: averaged_psf (default), per_bead_mean, "
+                        "per_bead_median.  Example: --reporting-mode averaged_psf "
+                        "per_bead_mean")
+    p.add_argument("--diagnostic-histogram-fit", action="store_true",
+                   help="Run histogram Gaussian fit on per-bead FWHMs and store "
+                        "the result in the JSON output (diagnostic only).")
     p.add_argument("--output",        type=str, default=None,
                    help="Output PSF TIFF path (default: <input>_psf.tif)")
     p.add_argument("--fit-mode",      type=str, default="1d",
@@ -1123,7 +1534,10 @@ if __name__ == "__main__":
             roi_um               = tuple(args.roi_um),
             sigma_xy_bounds      = tuple(args.sigma_xy),
             sigma_z_bounds       = tuple(args.sigma_z),
-            best_fraction        = args.best_fraction,
+            margin_px            = args.margin_px,
+            r2_threshold         = args.r2_threshold,
+            reporting_mode           = args.reporting_mode,
+            diagnostic_histogram_fit = args.diagnostic_histogram_fit,
             save_path            = args.output,
             fit_mode             = args.fit_mode,
             n_jobs               = args.n_jobs,
