@@ -27,8 +27,10 @@ Design notes
   cross-correlation for sparse bead images.
 - NaN masking in ndi.shift + np.nanmean avoids border artefacts without
   zero-padding bias.
-- The 3-D fit initial centroid is provided by the radial symmetry algorithm
-  of Parthasarathy (2012), giving sub-pixel accuracy without iterative fitting.
+- The 3-D fit uses a 3-D extension of the radial symmetry algorithm of
+  Parthasarathy (2012) as a sub-pixel initial centroid estimate (p0), reducing
+  the risk of the optimiser drifting to a local minimum relative to seeding
+  from the integer-resolution argmax.
 - An analytical Jacobian is supplied to curve_fit for the 3-D model, reducing
   the number of function evaluations required for convergence.
 - n_jobs > 1 is beneficial mainly in 3-D mode; in 1-D mode, per-bead wall

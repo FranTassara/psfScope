@@ -176,8 +176,11 @@ entire ROI volume by minimising the residual sum of squares over all voxels.
 The 8-parameter model
 I(z, y, x) = A · exp(−((z−c_z)²/2σ_z² + (y−c_y)²/2σ_y² + (x−c_x)²/2σ_x²)) + bg
 is initialised with sigma values from the 1-D empirical half-maximum widths and
-centroid coordinates (c_z₀, c_y₀, c_x₀) from the radial symmetry algorithm of
-@parthasarathy_2012, which provides sub-pixel accuracy without iterative fitting.
+centroid coordinates (c_z₀, c_y₀, c_x₀) from a 3-D extension of the radial
+symmetry algorithm of @parthasarathy_2012, which gives a sub-pixel initial
+estimate without requiring a separate iterative fit, reducing the risk of
+the optimiser converging to a local minimum compared to seeding from the
+integer-resolution intensity maximum.
 The optimisation is performed with `scipy.optimize.curve_fit` [@scipy] and
 accelerated by supplying an analytical Jacobian of the 3-D Gaussian model,
 reducing the number of function evaluations required for convergence. The same cascaded quality filter (sanity check, amplitude outlier removal, and
