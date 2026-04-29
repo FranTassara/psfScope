@@ -68,14 +68,53 @@ non-trivially from these models and to vary across the field of view.
 
 Empirical PSF estimation from fluorescent beads smaller than the diffraction
 limit is the standard approach to characterising the actual imaging PSF
-[@hanser_2004]. Several tools exist for this purpose.
-PSFj [@sage_2017] is a widely used ImageJ plugin, but it assumes isotropic
-voxels and lacks a programmatic API, limiting its integration into automated
-pipelines. The `localize-psf` library [@qi2lab_2023] is a Python package
-designed for single-molecule localisation microscopy that includes bead-based
-PSF estimation, but it targets isotropic data and requires a heavier
-installation with GPU-optional dependencies. Neither tool provides a visual
-map of PSF spatial variability across the microscope field of view.
+[@hanser_2004]. Several open-source tools exist for this purpose.
+PSFj [@sage_2017] is a widely used ImageJ plugin that reports FWHM
+measurements and per-bead spatial maps, but it assumes isotropic voxels and
+lacks a programmatic API, limiting its integration into automated pipelines.
+MetroloJ\_QC [@metrolojqc_2022] is a Fiji plugin designed for routine
+microscope quality control that measures per-bead FWHMs, but it assumes
+isotropic voxels, does not export a deconvolution-ready PSF kernel, and
+provides no scriptable API.
+The `localize-psf` library [@qi2lab_2023] is a Python package designed for
+single-molecule localisation microscopy that includes bead-based PSF
+estimation and a scriptable API, but it targets isotropic data and requires
+a heavier installation with GPU-optional dependencies.
+None of these tools natively handles the anisotropic voxel geometry of OPM
+data, nor do they provide a spatial map of PSF variability across the field
+of view combined with a scriptable pure-Python core.
+
+`psfScope` complements these tools by targeting the specific needs of OPM
+users — anisotropic voxels handled natively in physical units, spatial maps
+of resolution across the field of view, and a scriptable pure-Python core
+with an integrated GUI. Table 1 summarises the main feature differences.
+
+**Table 1.** Feature comparison between `psfScope` and the most widely used
+open-source bead-based PSF tools. ✓ = supported, ✗ = not supported,
+◐ = partial or dependent on configuration.
+
+| Feature | `psfScope` | PSFj [@sage_2017] | localize-psf [@qi2lab_2023] | MetroloJ\_QC [@metrolojqc_2022] |
+|---|:---:|:---:|:---:|:---:|
+| Platform | Python | ImageJ (Java) | Python | Fiji (Java) |
+| Open-source license | ✓ | ✓ | ✓ | ✓ |
+| Pure-Python install (no Java/ImageJ runtime) | ✓ | ✗ | ✓ | ✗ |
+| Scriptable programmatic API | ✓ | ✗ | ✓ | ✗ |
+| Built-in graphical user interface | ✓ | ✓ | ✗ | ✓ |
+| Anisotropic voxels (dz ≠ dx) in physical units | ✓ | ✗ | ◐ | ✗ |
+| Sub-pixel-aligned averaged PSF, deconvolution-ready TIFF | ✓ | ✓ | ✓ | ✗ |
+| Simultaneous 3-D Gaussian fit (in addition to 1-D) | ✓ | ✗ | ✓ | ✗ |
+| Per-bead spatial map across the field of view | ✓ | ✓ | ✗ | ✗ |
+| FWHM-vs-depth analysis (depth-dependent aberrations) | ✓ | ✗ | ✗ | ✗ |
+| Per-bead ellipticity and SNR exported | ✓ | ◐ | ✗ | ◐ |
+| Interactive click-to-inspect individual beads | ✓ | ✗ | ✗ | ✗ |
+| Quantitative comparison with vectorial/scalar theoretical PSF | ✓ | ✗ | ◐ | ✗ |
+| Per-bead CSV export for downstream analysis | ✓ | ◐ | ✓ | ✓ |
+| Batch processing of multiple bead volumes | ✓ | ◐ | ✓ | ◐ |
+
+The combination of a scriptable Python core, a built-in interactive GUI,
+anisotropic OPM-native geometry handling, spatial FOV diagnostics, and
+quantitative comparison against vectorial and scalar theoretical PSFs is,
+to our knowledge, not provided by any other openly available tool.
 
 `psfScope` was designed to fill this gap for OPM practitioners:
 
