@@ -46,11 +46,13 @@ assessment via 1-D sequential or simultaneous 3-D Gaussian fitting, signal-to-no
 ratio (SNR) estimation, sub-pixel alignment, and robust NaN-masked averaging.
 A lightweight graphical user interface (GUI) built on the Python standard
 library provides interactive parameter tuning, live progress feedback, and
-four visualisation panels. These panels include a per-bead spatial map of PSF
-variation across the field of view; FWHM histograms and a FWHM-versus-depth
-scatter to detect depth-dependent aberrations; an ellipticity metric that
-quantifies lateral PSF asymmetry; comparison against a Born-Wolf theoretical
-PSF; and an interactive click-to-inspect bead viewer. The tool runs entirely
+four dedicated visualisation tabs. These tabs provide: false-colour PSF
+cross-sections with non-Gaussian FWHM readout and an optional Born-Wolf
+reference overlay; a per-bead scatter map colour-coded by σ_xy with an
+interactive click-to-inspect bead viewer; a field-of-view map of resolution
+and ellipticity across the sample plane; and a FWHM diagnostics panel showing
+averaged-PSF profiles alongside per-bead FWHM histograms with Gaussian
+distribution fits. The tool runs entirely
 in Python, requires only widely available scientific packages, and exports
 results as standard 32-bit TIFF files ready for deconvolution pipelines.
 
@@ -120,7 +122,7 @@ map of PSF spatial variability across the microscope field of view.
 ## Algorithm
 
 The PSF estimation pipeline operates on a deskewed ZYX volume of
-sub-diffraction fluorescent beads and proceeds in eight steps
+sub-diffraction fluorescent beads and proceeds in seven steps
 (Figure 1).
 
 **Step 1 — Anisotropic band-pass filtering.**
@@ -155,17 +157,19 @@ Two fitting modes are available, selected by the user:
 *1-D sequential mode (default)*: independent 1-D Gaussian profiles are fitted
 along the Z, Y, and X axes through the intensity maximum using
 `scipy.optimize.curve_fit` [@scipy] with physiologically plausible sigma bounds
-enforced as hard constraints. The accepted fits then pass a cascaded quality
-filter: (i) all three fits must converge; (ii) a sanity check requires that the
-Gaussian centre is within `max_offset_px` pixels of the intensity peak, the
-background is non-negative and below the ROI maximum, and no sigma is within
-5 % of its upper bound (which would indicate the optimiser hit the constraint
-wall rather than finding a physical minimum); (iii) an amplitude outlier filter
-based on the Hampel identifier discards photobleached or saturated beads whose
-fitted amplitude deviates more than 3 × 1.4826 × MAD from the median amplitude
-of the accepted set; and (iv) the goodness-of-fit coefficient of determination
-R² must exceed a user-defined threshold (default 0.9), rejecting beads with
-non-Gaussian PSF shapes caused by doublets, debris, or insufficient SNR.
+enforced as hard constraints. The accepted fits then pass a cascaded quality filter: (i) all three fits must
+converge; (ii) the goodness-of-fit coefficient of determination R² must exceed
+a user-defined threshold (default 0.9), rejecting beads with non-Gaussian PSF
+shapes caused by doublets, debris, or insufficient SNR; (iii) a sanity check
+requires that the Gaussian centre is within `max_offset_px` pixels of the
+intensity peak, the background is non-negative and below the ROI maximum, and
+no sigma is within 5 % of its upper bound (which would indicate the optimiser
+hit the constraint wall rather than converging to a physical minimum); and
+(iv) an amplitude outlier filter based on the Hampel identifier discards
+photobleached or saturated beads whose fitted amplitude deviates more than
+3 × 1.4826 × MAD from the median amplitude of the surviving set. Running the
+amplitude filter last ensures that the distribution on which the MAD criterion
+operates consists only of beads with reliable, physically plausible fits.
 
 *3-D simultaneous mode*: a full anisotropic 3-D Gaussian is fitted to the
 entire ROI volume by minimising the residual sum of squares over all voxels.
@@ -201,25 +205,19 @@ multi-core speedup is achieved without additional dependencies. The default
 execution is particularly beneficial in 3-D fitting mode, where per-bead
 processing time is dominated by the iterative Gaussian optimisation.
 
-**Step 5 — Best-fraction selection.**
-The accepted beads are ranked by their mean lateral sigma (σ_xy = (σ_y + σ_x) / 2).
-The sharpest fraction (default: 50%) is retained for averaging. This step
-discards beads that were defocused or in an aberrated region of the sample
-during acquisition, following the approach of @qi2lab_2023.
-
-**Step 6 — Sub-pixel alignment and averaging.**
+**Step 5 — Sub-pixel alignment and averaging.**
 Each retained ROI is shifted by the sub-pixel offset of its fitted Gaussian
 centre from the geometric ROI centre using `scipy.ndimage.shift` with cubic
 interpolation. Border pixels created by the shift are assigned NaN. The
 aligned ROIs are combined with `numpy.nanmean` [@numpy], so that border NaN
 values are excluded from the average without introducing a zero-padding bias.
 
-**Step 7 — Normalisation and export.**
+**Step 6 — Normalisation and export.**
 The averaged PSF is normalised to unit sum and saved as a 32-bit floating-point
 TIFF with ImageJ-compatible metadata. It can be loaded directly by deconvolution
 software that accepts a sampled PSF kernel.
 
-**Step 8 — Theoretical PSF comparison (optional).**
+**Step 7 — Theoretical PSF comparison (optional).**
 When `compare_theoretical=True`, `psfmodels` [@psfmodels] is called to generate
 a theoretical PSF on the same ZYX voxel grid, using the user-supplied numerical
 aperture, emission wavelength, and immersion refractive index. Both vectorial
@@ -237,11 +235,11 @@ downstream analysis or visualisation.
 
 The GUI is implemented with the Python standard library `tkinter` module and
 `matplotlib` [@matplotlib] embedded via `FigureCanvasTkAgg`. It is organised
-into four tabs:
+into five tabs:
 
 **Estimation** — file selection (single file or folder batch), all algorithm
 parameters (pixel sizes, threshold, minimum bead separation, ROI dimensions,
-best fraction, fitting mode), an optional *Theoretical PSF* panel for entering
+R² threshold, fitting mode), an optional *Theoretical PSF* panel for entering
 the emission wavelength λ, numerical aperture NA, and refractive index n to
 compute Born-Wolf reference FWHMs, a real-time progress bar driven by a
 thread-safe queue callback, and a scrollable log.
@@ -278,6 +276,14 @@ plasma colormap (high is bright = good). Global minimum and maximum beads are
 annotated directly on the scatter, and the plot title encodes the full range
 and spread, making spatial patterns of resolution degradation and optical
 aberration immediately visible.
+
+**FWHM diagnostics** — a 2×3 grid of subplots showing the 1-D intensity
+profiles of the averaged PSF (Z, Y, X, top row) with cubic-spline fits and
+half-maximum crossings annotated, and per-bead FWHM histograms (Z, Y, X,
+bottom row) with Gaussian fits to the distribution peak. The histogram fits
+use a Poisson-weighted least-squares Gaussian to the modal region of each
+distribution, reporting the fitted modal FWHM and its width as a concise
+summary of PSF resolution across the bead ensemble.
 
 A per-bead CSV table is exported from the Beads tab. Each row records the
 bead position (pixels and µm), classification status, fitted sigma and FWHM

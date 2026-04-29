@@ -4,26 +4,33 @@ Experimental PSF estimation from sub-diffraction fluorescent bead images.
 Pipeline
 --------
 1. Anisotropic band-pass filter (Difference of Gaussians, DoG)
-2. Local maximum detection with an ellipsoidal footprint (respects dz ≠ dx)
-3. 3-D ROI extraction around each candidate
-4. Quality filter: 1-D sequential Gaussian fits (default) or simultaneous 3-D fit
-   - rejects beads outside sigma range, off-centre, or near the volume edge
-   - returns the sub-pixel centre offset from the Gaussian fit
-5. Percentile selection: keep the best X% by lateral sigma (sharpest beads)
-6. Sub-pixel centring using the Gaussian offset + NaN-mean averaging
-   (border pixels set to NaN do not contaminate the average)
-7. Save as a normalised float32 TIFF (sum = 1)
+2. Local maximum detection with an ellipsoidal footprint (respects dz ≠ dx),
+   followed by a post-detection isolation filter (minimum nearest-neighbour
+   distance in physical units)
+3. 3-D ROI extraction around each candidate; edge candidates discarded
+4. Per-bead Gaussian fitting: 1-D sequential (default) or simultaneous 3-D
+   Cascaded quality filter applied after fitting:
+   - fit convergence check
+   - goodness-of-fit threshold (R² ≥ r2_threshold, default 0.9)
+   - sanity check (centre displacement, unphysical background, sigma at bound)
+   - amplitude outlier removal via Hampel identifier (3 × 1.4826 × MAD)
+5. Sub-pixel alignment of each accepted ROI using the Gaussian centre offset,
+   followed by NaN-masked averaging (border pixels set to NaN do not bias the mean)
+6. Normalisation to unit sum and export as a 32-bit floating-point TIFF
+7. Optional quantitative comparison against a theoretical PSF (psfmodels)
 
 Design notes
 ------------
 - Anisotropic DoG and ellipsoidal footprint correctly handle oblique plane
   microscopy (OPM) data where the axial voxel size dz differs from dx.
-- Sub-pixel alignment via 1-D Gaussian fitting (inspired by QI2lab/localize-psf)
-  is more robust than phase cross-correlation for sparse bead images.
+- Sub-pixel alignment via Gaussian centre offset is more robust than phase
+  cross-correlation for sparse bead images.
 - NaN masking in ndi.shift + np.nanmean avoids border artefacts without
   zero-padding bias.
-- best_fraction retains the sharpest subset, removing beads that were
-  out-of-focus or aberrated during acquisition.
+- The 3-D fit initial centroid is provided by the radial symmetry algorithm
+  of Parthasarathy (2012), giving sub-pixel accuracy without iterative fitting.
+- An analytical Jacobian is supplied to curve_fit for the 3-D model, reducing
+  the number of function evaluations required for convergence.
 
 The resulting PSF can be used directly in postprocess_deconvolution.py as an
 alternative to a theoretical PSF, without requiring external software (PSFj,
@@ -425,7 +432,7 @@ def _quality_check_3d(roi, dx, dz, sigma_xy_bounds, sigma_z_bounds):
     bg0 = float(np.percentile(roi, 10))
     A0  = float(np.max(roi)) - bg0
     if A0 <= 0:
-        return False, None, None, None, None
+        return False, None, None, None, None, None, None, None
 
     # Sub-pixel centroid via radial symmetry: better p0 for (cz, cy, cx) than
     # integer-resolution argmax, with no additional iterative fitting.
@@ -566,6 +573,13 @@ def _process_one_bead(cz, cy, cx, volume, nz, ny, nx, rz, ry, rx,
         cx - rx : cx + rx + 1,
     ].astype(np.float32)
 
+    # Coarse baseline shift: bring the ROI floor to approximately zero so that
+    # (a) the initial amplitude guess A0 = max(roi) is unbiased by a large
+    # additive offset, and (b) _radial_symmetry_3d operates on gradients that
+    # are dominated by the bead rather than background slope.  The Gaussian fit
+    # still includes a free 'bg' parameter to absorb any residual offset that
+    # the 5th-percentile estimate did not remove (e.g. when the bead is bright
+    # enough to contaminate the lower percentile bins of a small ROI).
     roi -= np.percentile(roi, 5)
     roi  = np.clip(roi, 0, None)
 
@@ -985,17 +999,20 @@ def estimate_psf_from_beads(
 
     Filter stack (applied after per-bead Gaussian fit)
     ---------------------------------------------------
-    1. Edge     — discard beads within (ROI_half + margin_px) of the border.
+    1. Edge      — discard beads within (ROI_half + margin_px) of the border.
     2. Isolation — discard beads whose nearest neighbour is closer than
                    min_sep_um (3D Euclidean distance in µm).
     3. Fit       — discard beads where the Gaussian fit failed to converge.
-    4. Amplitude — MAD outlier filter on fitted bead amplitude.
-    5. R²        — discard beads with Gaussian fit quality R² < r2_threshold.
-    6. Sanity   — discard beads with unphysical fit parameters (centre
+    4. R²        — discard beads with Gaussian fit quality R² < r2_threshold.
+    5. Sanity    — discard beads with unphysical fit parameters (centre
                    displacement, background, sigma at constraint wall).
+    6. Amplitude — MAD outlier filter on fitted bead amplitude (Hampel
+                   identifier; runs last so the amplitude distribution is
+                   computed only from beads with reliable, physically sensible
+                   fits).
 
     Log: "Beads: detected=N0 → edge=N1 → isolation=N2 → fit_ok=N2b →
-          amplitude=N3 → r²=N4 → sanity=N5"
+          r²=N3 → sanity=N4 → amplitude=N5"
 
     FWHM reporting
     --------------
@@ -1179,23 +1196,24 @@ def estimate_psf_from_beads(
     fit_fail_list = [r for r in raw_results if r['status'] == 'fit_failed']
     n2b = len(fit_ok_list)
 
-    # --- Filter 3: Amplitude (MAD) ---
-    amp_idx  = _filter_amplitude(fit_ok_list)
-    amp_surv = [fit_ok_list[i] for i in amp_idx]
-    n3       = len(amp_surv)
+    # --- Filter 3: R² (fit quality gate; runs before physical outlier checks) ---
+    r2_idx   = _filter_r2(fit_ok_list, r2_threshold)
+    r2_surv  = [fit_ok_list[i] for i in r2_idx]
+    n3       = len(r2_surv)
 
-    # --- Filter 4: R² ---
-    r2_idx   = _filter_r2(amp_surv, r2_threshold)
-    r2_surv  = [amp_surv[i] for i in r2_idx]
-    n4       = len(r2_surv)
+    # --- Filter 4: Sanity (specific fit failure modes) ---
+    san_idx  = _filter_sanity(r2_surv, sigma_xy_bounds, sigma_z_bounds)
+    san_surv = [r2_surv[i] for i in san_idx]
+    n4       = len(san_surv)
 
-    # --- Filter 5: Sanity ---
-    san_idx     = _filter_sanity(r2_surv, sigma_xy_bounds, sigma_z_bounds)
-    final_beads = [r2_surv[i] for i in san_idx]
+    # --- Filter 5: Amplitude (Hampel/MAD; last so the distribution is built
+    #     from beads with reliable, physically sensible fits only) ---
+    amp_idx     = _filter_amplitude(san_surv)
+    final_beads = [san_surv[i] for i in amp_idx]
     n5          = len(final_beads)
 
     filter_log = (f"Beads: detected={n0} → edge={n1} → isolation={n2} → "
-                  f"fit_ok={n2b} → amplitude={n3} → r²={n4} → sanity={n5}")
+                  f"fit_ok={n2b} → r²={n3} → sanity={n4} → amplitude={n5}")
     if verbose:
         print(f"[PSF] {filter_log}")
     _cb(0.78, filter_log)
@@ -1234,7 +1252,12 @@ def estimate_psf_from_beads(
     psf = _center_and_average(valid_rois, offsets_list)
 
     # --- Normalise ---
-    psf -= np.nanmin(psf)
+    # Clip before normalising rather than subtracting nanmin: cubic-spline
+    # shifts (order=3) can introduce small negative ringing artefacts adjacent
+    # to the NaN border.  Subtracting nanmin when it is negative would add an
+    # artificial positive floor to every voxel, biasing the sum-normalised
+    # kernel and degrading deconvolution.  Clipping removes only the artefacts.
+    psf = np.clip(psf, 0, None)
     total = np.nansum(psf)
     if total > 0:
         psf /= total
