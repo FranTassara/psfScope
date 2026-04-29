@@ -137,7 +137,12 @@ Local maxima are detected on the DoG image using `skimage.feature.peak_local_max
 the minimum bead-separation distance in µm, converted to per-axis pixel counts.
 This is critical for OPM data where the axial footprint in pixels is
 systematically smaller than the lateral footprint. A threshold (automatic or
-user-supplied) removes dim candidates that are likely to be noise peaks.
+user-supplied) removes dim candidates that are likely to be noise peaks. As a
+second isolation step applied after detection, candidates whose nearest
+neighbour is closer than `min_sep_um` in physical units are discarded; this
+stricter criterion removes beads whose PSFs may optically overlap even if they
+were detected as separate peaks, since overlapping PSFs produce systematic
+biases in the Gaussian fit.
 
 **Step 3 — ROI extraction.**
 A user-defined ROI is extracted around each candidate. Candidates whose ROI
@@ -149,11 +154,18 @@ Two fitting modes are available, selected by the user:
 
 *1-D sequential mode (default)*: independent 1-D Gaussian profiles are fitted
 along the Z, Y, and X axes through the intensity maximum using
-`scipy.optimize.curve_fit` [@scipy]. A bead is accepted only if: (i) all
-three fits converge; (ii) the fitted sigma values fall within user-defined
-physiologically plausible bounds; and (iii) the Gaussian centre is within a
-tolerance of the geometric ROI centre, rejecting beads that are eccentric
-within their ROI.
+`scipy.optimize.curve_fit` [@scipy] with physiologically plausible sigma bounds
+enforced as hard constraints. The accepted fits then pass a cascaded quality
+filter: (i) all three fits must converge; (ii) a sanity check requires that the
+Gaussian centre is within `max_offset_px` pixels of the intensity peak, the
+background is non-negative and below the ROI maximum, and no sigma is within
+5 % of its upper bound (which would indicate the optimiser hit the constraint
+wall rather than finding a physical minimum); (iii) an amplitude outlier filter
+based on the Hampel identifier discards photobleached or saturated beads whose
+fitted amplitude deviates more than 3 × 1.4826 × MAD from the median amplitude
+of the accepted set; and (iv) the goodness-of-fit coefficient of determination
+R² must exceed a user-defined threshold (default 0.9), rejecting beads with
+non-Gaussian PSF shapes caused by doublets, debris, or insufficient SNR.
 
 *3-D simultaneous mode*: a full anisotropic 3-D Gaussian is fitted to the
 entire ROI volume by minimising the residual sum of squares over all voxels.
@@ -164,10 +176,10 @@ centroid coordinates (c_z₀, c_y₀, c_x₀) from the radial symmetry algorithm
 @parthasarathy_2012, which provides sub-pixel accuracy without iterative fitting.
 The optimisation is performed with `scipy.optimize.curve_fit` [@scipy] and
 accelerated by supplying an analytical Jacobian of the 3-D Gaussian model,
-reducing the number of function evaluations required for convergence. The same
-sigma-bounds and centre-offset checks are applied as in 1-D mode. This mode
-captures PSF asymmetries that sequential 1-D fits may miss, at the cost of
-approximately 10–100× longer processing time per bead.
+reducing the number of function evaluations required for convergence. The same cascaded quality filter (sanity check, amplitude outlier removal, and
+R² threshold) is applied as in 1-D mode. This mode captures PSF asymmetries
+that sequential 1-D fits may miss, at the cost of approximately 10–100×
+longer processing time per bead.
 
 **Step 4b — SNR estimation.**
 For each accepted bead, the signal-to-noise ratio is computed as the ratio of
@@ -236,9 +248,12 @@ thread-safe queue callback, and a scrollable log.
 
 **PSF** — false-colour cross-sections (XY, XZ, YZ) of the estimated PSF with
 crosshair cursors at the central plane. Two text lines are displayed below the
-figure: a blue line with the measured FWHM values derived from 1-D Gaussian
-fits to the averaged PSF, and an orange line with the theoretical Born-Wolf
-FWHMs (visible only when the theoretical overlay is enabled).
+figure: a blue line with the measured FWHM values derived from 1-D cubic-spline
+profiles through the peak voxel of the averaged PSF, with the half-maximum
+crossing found by linear interpolation between adjacent oversampled points
+(10× resolution; no Gaussian shape is assumed), and an orange line with the
+theoretical Born-Wolf FWHMs (visible only when the theoretical overlay is
+enabled).
 
 **Beads** — a spatial scatter plot on the left panel shows all detected bead
 candidates colour-coded by outcome: border-rejected (light gray ×),
