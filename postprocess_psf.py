@@ -31,6 +31,8 @@ Design notes
   of Parthasarathy (2012), giving sub-pixel accuracy without iterative fitting.
 - An analytical Jacobian is supplied to curve_fit for the 3-D model, reducing
   the number of function evaluations required for convergence.
+- n_jobs > 1 is beneficial mainly in 3-D mode; in 1-D mode, per-bead wall
+  time is of the order of milliseconds and threading overhead dominates.
 
 The resulting PSF can be used directly in postprocess_deconvolution.py as an
 alternative to a theoretical PSF, without requiring external software (PSFj,

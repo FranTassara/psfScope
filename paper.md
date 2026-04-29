@@ -198,12 +198,15 @@ to be identified and optionally excluded from downstream analysis.
 The per-bead loop (Steps 3–4b) can be parallelised across multiple CPU threads
 via the `n_jobs` parameter of `estimate_psf_from_beads`. Each bead is processed
 as an independent task using Python's standard `concurrent.futures.ThreadPoolExecutor`.
-Because the computationally intensive operations — NumPy array manipulations and
-SciPy optimisation — release the Global Interpreter Lock (GIL), genuine
-multi-core speedup is achieved without additional dependencies. The default
-`n_jobs=1` preserves sequential behaviour for backward compatibility. Parallel
-execution is particularly beneficial in 3-D fitting mode, where per-bead
-processing time is dominated by the iterative Gaussian optimisation.
+NumPy array operations and SciPy optimisation release the Global Interpreter
+Lock (GIL), so threads can execute concurrently on multiple cores without
+additional dependencies. The practical benefit depends strongly on the fitting
+mode: in 3-D mode, where per-bead processing time is dominated by iterative
+Gaussian optimisation over all ROI voxels, multi-core speedup is noticeable; in
+1-D mode, per-bead wall time is of the order of milliseconds and threading
+overhead is likely to offset most of the gain. The default `n_jobs=1` preserves
+sequential behaviour; increasing `n_jobs` is therefore recommended primarily
+when using `fit_mode='3d'` on large bead datasets.
 
 **Step 5 — Sub-pixel alignment and averaging.**
 Each retained ROI is shifted by the sub-pixel offset of its fitted Gaussian
@@ -287,8 +290,11 @@ summary of PSF resolution across the bead ensemble.
 
 A per-bead CSV table is exported from the Beads tab. Each row records the
 bead position (pixels and µm), classification status, fitted sigma and FWHM
-values for all three axes (σ_z, σ_y, σ_x, σ_xy), PSF ellipticity, and SNR,
-enabling downstream statistical analysis or filtering in external tools.
+values for all three axes (σ_z, σ_y, σ_x, σ_xy), PSF ellipticity, and SNR.
+In batch mode (multiple input volumes), two additional columns are included:
+a zero-based `volume_id` integer and the `source_file` basename, preserving
+full provenance for downstream statistical analysis or filtering in external
+tools.
 
 ## Testing
 

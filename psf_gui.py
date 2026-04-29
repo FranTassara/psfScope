@@ -880,11 +880,23 @@ class PSFScopeGUI:
                 )
                 break
 
-        # volume_id: one entry per accepted bead
-        vol_id_arrays = [
-            np.full(bd['n_accepted'], vid, dtype=np.int32)
+        # volume_id: one entry per bead in each category
+        vol_id_accepted = [
+            np.full(bd['n_accepted'],       vid, dtype=np.int32)
             for vid, (_, bd, _) in enumerate(results)
         ]
+        vol_id_border = [
+            np.full(len(bd['border_px']),   vid, dtype=np.int32)
+            for vid, (_, bd, _) in enumerate(results)
+        ]
+        vol_id_rejected = [
+            np.full(len(bd['rejected_px']), vid, dtype=np.int32)
+            for vid, (_, bd, _) in enumerate(results)
+        ]
+
+        def _concat_or_empty(arrays):
+            nonempty = [a for a in arrays if len(a) > 0]
+            return np.concatenate(nonempty) if nonempty else np.array([], dtype=np.int32)
 
         return {
             'dx':        bd0['dx'],
@@ -899,10 +911,12 @@ class PSFScopeGUI:
             'accepted_ellipticity': np.concatenate([r[1]['accepted_ellipticity'] for r in results]),
             'accepted_snr':         np.concatenate([r[1]['accepted_snr']         for r in results]),
             'accepted_used':        np.concatenate([r[1]['accepted_used']        for r in results]),
-            'volume_id':            np.concatenate(vol_id_arrays),
+            'volume_id':            _concat_or_empty(vol_id_accepted),
             # Rejected / border arrays
-            'border_px':   _vstack_px([r[1]['border_px']   for r in results]),
-            'rejected_px': _vstack_px([r[1]['rejected_px'] for r in results]),
+            'border_px':          _vstack_px([r[1]['border_px']   for r in results]),
+            'rejected_px':        _vstack_px([r[1]['rejected_px'] for r in results]),
+            'border_volume_id':   _concat_or_empty(vol_id_border),
+            'rejected_volume_id': _concat_or_empty(vol_id_rejected),
             # Summed counts
             'n_total':            sum(r[1]['n_total']            for r in results),
             'n_border':           sum(r[1]['n_border']           for r in results),
@@ -1838,6 +1852,8 @@ class PSFScopeGUI:
         Columns
         -------
         bead_id                     — sequential integer (all categories)
+        volume_id                   — 0-based source volume index (batch only)
+        source_file                 — basename of the source TIFF (batch only)
         z_px, y_px, x_px            — position in pixels
         z_um, y_um, x_um            — position in µm
         status                      — border_rejected | quality_rejected |
@@ -1859,14 +1875,17 @@ class PSFScopeGUI:
         if not path:
             return
 
-        bd  = self._bead_data
-        dx  = bd['dx']
-        dz  = bd['dz']
+        bd       = self._bead_data
+        dx       = bd['dx']
+        dz       = bd['dz']
+        is_batch = 'volume_paths' in bd
 
         FWHM = 2.355 * 1000   # µm → nm conversion factor
 
-        fieldnames = [
-            'bead_id',
+        fieldnames = ['bead_id']
+        if is_batch:
+            fieldnames += ['volume_id', 'source_file']
+        fieldnames += [
             'z_px', 'y_px', 'x_px',
             'z_um', 'y_um', 'x_um',
             'status',
@@ -1875,7 +1894,7 @@ class PSFScopeGUI:
             'ellipticity', 'snr',
         ]
 
-        rows = []
+        rows    = []
         bead_id = 0
 
         _empty = {
@@ -1884,10 +1903,19 @@ class PSFScopeGUI:
             'ellipticity': '', 'snr': '',
         }
 
-        # Border-rejected (no sigma data available)
-        for z, y, x in bd['border_px']:
+        def _vol_fields(vid):
+            if not is_batch:
+                return {}
+            src = os.path.basename(bd['volume_paths'][vid])
+            return {'volume_id': int(vid), 'source_file': src}
+
+        # Border-rejected
+        border_vids = bd.get('border_volume_id', [])
+        for j, (z, y, x) in enumerate(bd['border_px']):
+            vid = int(border_vids[j]) if is_batch and j < len(border_vids) else 0
             rows.append({
                 'bead_id': bead_id,
+                **_vol_fields(vid),
                 'z_px': z,  'y_px': y,  'x_px': x,
                 'z_um': f"{z*dz:.4f}", 'y_um': f"{y*dx:.4f}", 'x_um': f"{x*dx:.4f}",
                 'status': 'border_rejected',
@@ -1895,10 +1923,13 @@ class PSFScopeGUI:
             })
             bead_id += 1
 
-        # Quality-rejected (no sigma data available)
-        for z, y, x in bd['rejected_px']:
+        # Quality-rejected
+        rejected_vids = bd.get('rejected_volume_id', [])
+        for j, (z, y, x) in enumerate(bd['rejected_px']):
+            vid = int(rejected_vids[j]) if is_batch and j < len(rejected_vids) else 0
             rows.append({
                 'bead_id': bead_id,
+                **_vol_fields(vid),
                 'z_px': z,  'y_px': y,  'x_px': x,
                 'z_um': f"{z*dz:.4f}", 'y_um': f"{y*dx:.4f}", 'x_um': f"{x*dx:.4f}",
                 'status': 'quality_rejected',
@@ -1907,19 +1938,22 @@ class PSFScopeGUI:
             bead_id += 1
 
         # Accepted beads (with sigma data)
-        acc_px = bd['accepted_px']
-        sz     = bd['accepted_sigma_z']
-        sy     = bd['accepted_sigma_y']
-        sx     = bd['accepted_sigma_x']
-        sxy    = bd['accepted_sigma_xy']
-        ell    = bd['accepted_ellipticity']
-        snr    = bd['accepted_snr']
-        used   = bd['accepted_used']
+        acc_px    = bd['accepted_px']
+        sz        = bd['accepted_sigma_z']
+        sy        = bd['accepted_sigma_y']
+        sx        = bd['accepted_sigma_x']
+        sxy       = bd['accepted_sigma_xy']
+        ell       = bd['accepted_ellipticity']
+        snr       = bd['accepted_snr']
+        used      = bd['accepted_used']
+        acc_vids  = bd.get('volume_id', [])
 
         for i in range(len(acc_px)):
             z, y, x = acc_px[i]
+            vid = int(acc_vids[i]) if is_batch and i < len(acc_vids) else 0
             rows.append({
                 'bead_id': bead_id,
+                **_vol_fields(vid),
                 'z_px': z,  'y_px': y,  'x_px': x,
                 'z_um': f"{z*dz:.4f}", 'y_um': f"{y*dx:.4f}", 'x_um': f"{x*dx:.4f}",
                 'status': 'used_in_psf' if used[i] else 'accepted',
