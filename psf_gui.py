@@ -1,12 +1,13 @@
 """
 psfScope GUI — Graphical interface for estimate_psf_from_beads.
 
-Four tabs
+Five tabs
 ---------
-1. Estimation  — parameters, progress bar, log
+1. Estimation  — parameters, progress bar, log, PDF-report export
 2. PSF         — XY / XZ / YZ cross-sections with FWHM readout
 3. Beads       — detected bead map and FWHM histograms
 4. FOV Map     — spatial variation of resolution across the field of view
+5. FWHM diagnostics — averaged-PSF profiles and per-bead FWHM histograms
 
 Usage
 -----
@@ -37,6 +38,40 @@ PAD = {"padx": 8, "pady": 4}
 
 
 # =============================================================================
+# Tooltip helper (Tkinter has no built-in widget)
+# =============================================================================
+
+class _Tooltip:
+    """Lightweight tooltip that follows the widget on Enter / Leave."""
+
+    def __init__(self, widget, text):
+        self._widget = widget
+        self._text   = text
+        self._win    = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _evt=None):
+        if self._win:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._win = tk.Toplevel(self._widget)
+        self._win.wm_overrideredirect(True)
+        self._win.wm_geometry(f"+{x}+{y}")
+        ttk.Label(
+            self._win, text=self._text, justify="left",
+            background="#fffbcc", relief="solid", borderwidth=1,
+            font=("TkDefaultFont", 8), wraplength=320,
+        ).pack()
+
+    def _hide(self, _evt=None):
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+
+# =============================================================================
 # Main GUI class
 # =============================================================================
 
@@ -60,6 +95,11 @@ class PSFScopeGUI:
         self.na_var          = tk.StringVar(value="1.1")   # numerical aperture
         self.n_var           = tk.StringVar(value="1.33")  # refractive index (water)
         self.show_theory_var = tk.BooleanVar(value=False)
+
+        # New parameters
+        self.best_fraction_var  = tk.StringVar(value="1.0")
+        self.bead_diameter_var  = tk.StringVar(value="0")
+        self.show_corrected_var = tk.BooleanVar(value=False)
 
         self._build_ui()
 
@@ -221,22 +261,44 @@ class PSFScopeGUI:
                        "Reduce ROI Z (e.g. 1.2) for thin volumes.",
                   foreground="gray").grid(row=5, column=0, columnspan=6, sticky="w", padx=8)
 
+        # Best-fraction and bead-diameter row
+        bf_lbl = ttk.Label(pf, text="Best fraction (σ_xy):")
+        bf_lbl.grid(row=6, column=0, sticky="w", **PAD)
+        bf_spin = ttk.Spinbox(pf, from_=0.1, to=1.0, increment=0.05,
+                              textvariable=self.best_fraction_var, width=8)
+        bf_spin.grid(row=6, column=1, sticky="w", **PAD)
+        _Tooltip(bf_spin,
+                 "Keep only the sharpest fraction of accepted beads for PSF averaging.\n"
+                 "1.0 = keep all (default). 0.5 = keep the 50%% with smallest σ_xy.\n"
+                 "Range 0.1–1.0, step 0.05.")
+
+        bd_lbl = ttk.Label(pf, text="Bead diameter (nm):")
+        bd_lbl.grid(row=6, column=2, sticky="w", **PAD)
+        bd_entry = ttk.Entry(pf, textvariable=self.bead_diameter_var, width=8)
+        bd_entry.grid(row=6, column=3, sticky="w", **PAD)
+        ttk.Label(pf, text="0 = no correction", foreground="gray").grid(
+            row=6, column=4, sticky="w", padx=4)
+        _Tooltip(bd_entry,
+                 "Known fluorescent bead diameter [nm] for finite-bead-size correction.\n"
+                 "Corrected FWHM = sqrt(FWHM_measured² − d²).\n"
+                 "Typical values: 100–220 nm. Set to 0 to skip (default).")
+
         # Fitting mode
         fit_lbl = ttk.Label(pf, text="Fitting mode:")
-        fit_lbl.grid(row=6, column=0, sticky="w", **PAD)
+        fit_lbl.grid(row=7, column=0, sticky="w", **PAD)
 
         self.fit_mode_var = tk.StringVar(value="1d")
         ttk.Radiobutton(pf, text="1D sequential  (fast)",
                         variable=self.fit_mode_var, value="1d").grid(
-            row=6, column=1, columnspan=2, sticky="w", padx=4)
+            row=7, column=1, columnspan=2, sticky="w", padx=4)
         ttk.Radiobutton(pf, text="3D simultaneous  (accurate, slower)",
                         variable=self.fit_mode_var, value="3d").grid(
-            row=6, column=3, columnspan=3, sticky="w", padx=4)
+            row=7, column=3, columnspan=3, sticky="w", padx=4)
 
         ttk.Label(pf,
                   text="3D fits a full Gaussian to the ROI volume — more accurate for "
                        "asymmetric PSFs but ~10–100× slower per bead.",
-                  foreground="gray").grid(row=7, column=0, columnspan=6, sticky="w", padx=8)
+                  foreground="gray").grid(row=8, column=0, columnspan=6, sticky="w", padx=8)
 
         # --- Theoretical PSF (optional) ---
         tf = ttk.LabelFrame(param_row, text="Theoretical PSF (optional)")
@@ -262,6 +324,10 @@ class PSFScopeGUI:
                         command=self._refresh_theory_overlay).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
+        # Tooltips on the existing parameter fields
+        _Tooltip(pf.grid_slaves(row=0, column=1)[0] if pf.grid_slaves(row=0, column=1) else pf,
+                 "Lateral (XY) pixel size in µm.\nTypical OPM: 0.100–0.150 µm.")
+
         # --- Run button + progress bar ---
         ctrl = ttk.Frame(parent)
         ctrl.grid(row=3, column=0, sticky="ew", **PAD)
@@ -269,6 +335,10 @@ class PSFScopeGUI:
         self.run_btn = ttk.Button(ctrl, text="▶  Run PSF estimation",
                                   command=self._run)
         self.run_btn.pack(side="left", padx=8)
+
+        self.reset_btn = ttk.Button(ctrl, text="↺  Reset defaults",
+                                    command=self._reset_defaults)
+        self.reset_btn.pack(side="left", padx=4)
 
         self.clear_btn = ttk.Button(ctrl, text="✕  Clear",
                                     command=self._clear_results, state="disabled")
@@ -288,6 +358,10 @@ class PSFScopeGUI:
         self.load_res_btn = ttk.Button(ctrl, text="Load results …",
                                        command=self._load_results)
         self.load_res_btn.pack(side="right", padx=4)
+
+        self.pdf_btn = ttk.Button(ctrl, text="⬇  Export PDF report",
+                                  command=self._export_pdf, state="disabled")
+        self.pdf_btn.pack(side="right", padx=4)
 
         # --- Log ---
         lf = ttk.LabelFrame(parent, text="Log")
@@ -423,6 +497,9 @@ class PSFScopeGUI:
                         variable=self.fov_all_var,
                         command=self._refresh_fov).pack(side="left", padx=10)
 
+        ttk.Button(ctrl, text="⬇  Save PNG",
+                   command=self._save_fov_png).pack(side="right", padx=6)
+
         # Figure
         self.fov_fig = Figure(figsize=(8, 6), tight_layout=True)
         self.fov_ax  = self.fov_fig.add_subplot(111)
@@ -484,7 +561,9 @@ class PSFScopeGUI:
     def _parse_params(self):
         dx             = float(self.dx_var.get())
         dz             = float(self.dz_var.get())
-        thr            = float(self.thr_var.get()) if self.thr_var.get().strip() else None
+        thr_raw        = self.thr_var.get().strip().lower()
+        # Accept empty, "auto", or a numeric string; all mean automatic threshold
+        thr            = None if (not thr_raw or thr_raw == "auto") else float(thr_raw)
         sep            = float(self.sep_var.get())
         margin_px      = int(self.margin_px_var.get())
         r2_threshold   = float(self.r2_thresh_var.get())
@@ -495,11 +574,14 @@ class PSFScopeGUI:
         ] if v]
         if not reporting_mode:
             raise ValueError("Select at least one reporting mode.")
-        roi      = (float(self.roi_z_var.get()),
-                    float(self.roi_y_var.get()),
-                    float(self.roi_x_var.get()))
-        fit_mode = self.fit_mode_var.get()
-        return dx, dz, thr, sep, margin_px, r2_threshold, reporting_mode, roi, fit_mode
+        roi              = (float(self.roi_z_var.get()),
+                            float(self.roi_y_var.get()),
+                            float(self.roi_x_var.get()))
+        fit_mode         = self.fit_mode_var.get()
+        best_fraction    = float(self.best_fraction_var.get())
+        bead_diameter_nm = float(self.bead_diameter_var.get())
+        return (dx, dz, thr, sep, margin_px, r2_threshold,
+                reporting_mode, roi, fit_mode, best_fraction, bead_diameter_nm)
 
     def _run(self):
         inp = self.input_var.get().strip()
@@ -508,7 +590,9 @@ class PSFScopeGUI:
             return
 
         try:
-            dx, dz, thr, sep, margin_px, r2_threshold, reporting_mode, roi, fit_mode = self._parse_params()
+            (dx, dz, thr, sep, margin_px, r2_threshold,
+             reporting_mode, roi, fit_mode,
+             best_fraction, bead_diameter_nm) = self._parse_params()
         except ValueError as e:
             messagebox.showerror("Parameter error", str(e))
             return
@@ -559,6 +643,8 @@ class PSFScopeGUI:
                             reporting_mode    = reporting_mode,
                             save_path         = save,
                             fit_mode          = fit_mode,
+                            best_fraction     = best_fraction,
+                            bead_diameter_nm  = bead_diameter_nm,
                             verbose           = True,
                             progress_callback = _cb,
                             return_bead_data  = True,
@@ -645,6 +731,7 @@ class PSFScopeGUI:
                     self.run_btn.config(state="normal")
                     self.clear_btn.config(state="normal")
                     self.save_res_btn.config(state="normal")
+                    self.pdf_btn.config(state="normal")
                     self._update_all_plots()
                     return
 
@@ -824,6 +911,7 @@ class PSFScopeGUI:
         # Disable until the next successful run
         self.clear_btn.config(state="disabled")
         self.save_res_btn.config(state="disabled")
+        self.pdf_btn.config(state="disabled")
 
     # =========================================================================
     # Batch merge helpers
@@ -985,6 +1073,24 @@ class PSFScopeGUI:
                            'fwhm_per_bead_median_nm': _r(med_x), 'fwhm_per_bead_mad_nm': _r(mad_x)},
             },
         })
+
+    def _reset_defaults(self):
+        """Restore all parameter widgets to their factory defaults."""
+        self.dx_var.set("0.127")
+        self.dz_var.set("0.110")
+        self.thr_var.set("")
+        self.sep_var.set("2.0")
+        self.margin_px_var.set("2")
+        self.r2_thresh_var.set("0.9")
+        self.roi_z_var.set("2.5")
+        self.roi_y_var.set("2.5")
+        self.roi_x_var.set("2.5")
+        self.fit_mode_var.set("1d")
+        self.best_fraction_var.set("1.0")
+        self.bead_diameter_var.set("0")
+        self.rm_avg_var.set(True)
+        self.rm_mean_var.set(False)
+        self.rm_median_var.set(False)
 
     # =========================================================================
     # Plot updates
@@ -1511,13 +1617,27 @@ class PSFScopeGUI:
             self.fov_ax.text(0.5, 0.5, "No beads to display",
                              ha="center", va="center",
                              transform=self.fov_ax.transAxes, color="gray")
+        elif len(xs) < 10:
+            self.fov_ax.text(
+                0.5, 0.5,
+                f"Insufficient data — only {len(xs)} bead(s).\n"
+                "At least 10 are needed for a meaningful FOV map.\n"
+                "Try lowering the threshold or r² threshold.",
+                ha="center", va="center",
+                transform=self.fov_ax.transAxes, color="gray",
+                fontsize=10, wrap=True,
+            )
         else:
-            # For ellipticity use a symmetric diverging scale centred at 0
+            # Colour limits: 5th–95th percentile to suppress outlier distortion.
+            # Ellipticity: symmetric diverging scale centred at the 50th percentile.
             if is_ellipticity:
-                half = max(abs(vs.min()), abs(vs.max()))
-                vmin_c, vmax_c = -half, half
+                med   = float(np.percentile(vs, 50))
+                half  = max(abs(float(np.percentile(vs, 5))  - med),
+                            abs(float(np.percentile(vs, 95)) - med))
+                vmin_c, vmax_c = med - half, med + half
             else:
-                vmin_c, vmax_c = vs.min(), vs.max()
+                vmin_c = float(np.percentile(vs, 5))
+                vmax_c = float(np.percentile(vs, 95))
 
             sc = self.fov_ax.scatter(
                 xs, ys, c=vs, cmap=cmap_name,
@@ -1670,43 +1790,51 @@ class PSFScopeGUI:
         dx  = bd['dx']
         dz  = bd['dz']
 
-        # Load the source volume
-        if not self._last_tif_path or not os.path.isfile(self._last_tif_path):
-            messagebox.showwarning(
-                "Volume unavailable",
-                "The source TIFF is not accessible.\n"
-                "Bead inspection requires the original volume file.",
-            )
-            return
-        try:
-            from tifffile import imread as _imread
-            volume = _imread(self._last_tif_path).astype(np.float32)
-        except Exception as exc:
-            messagebox.showerror("Load error", str(exc))
-            return
+        # Use the cached ROI when available — avoids re-reading the source TIFF
+        # (which may have been moved or renamed after the run).
+        _rois_cache = bd.get('accepted_rois')
+        if (acc_idx is not None and _rois_cache is not None
+                and acc_idx < len(_rois_cache)):
+            roi = np.asarray(_rois_cache[acc_idx], dtype=np.float32).copy()
+            roi -= float(np.percentile(roi, 5))
+            roi  = np.clip(roi, 0.0, None)
+        else:
+            # Fall back to reading the source TIFF from disk
+            if not self._last_tif_path or not os.path.isfile(self._last_tif_path):
+                messagebox.showwarning(
+                    "Volume unavailable",
+                    "The source TIFF is not accessible and no ROI cache is present.\n"
+                    "Bead inspection is unavailable for this result.",
+                )
+                return
+            try:
+                from tifffile import imread as _imread
+                volume = _imread(self._last_tif_path).astype(np.float32)
+            except Exception as exc:
+                messagebox.showerror("Load error", str(exc))
+                return
 
-        roi_shape = bd.get('roi_shape', (25, 41, 41))
-        rz = roi_shape[0] // 2
-        ry = roi_shape[1] // 2
-        rx = roi_shape[2] // 2
-        nz, ny, nx = volume.shape
+            roi_shape = bd.get('roi_shape', (25, 41, 41))
+            rz = roi_shape[0] // 2
+            ry = roi_shape[1] // 2
+            rx = roi_shape[2] // 2
+            nz, ny, nx = volume.shape
 
-        # Extract ROI with zero-padding for border beads
-        z0, z1 = z_px - rz, z_px + rz + 1
-        y0, y1 = y_px - ry, y_px + ry + 1
-        x0, x1 = x_px - rx, x_px + rx + 1
+            z0, z1 = z_px - rz, z_px + rz + 1
+            y0, y1 = y_px - ry, y_px + ry + 1
+            x0, x1 = x_px - rx, x_px + rx + 1
 
-        roi = np.zeros(roi_shape, dtype=np.float32)
-        vz0, vz1 = max(0, z0), min(nz, z1)
-        vy0, vy1 = max(0, y0), min(ny, y1)
-        vx0, vx1 = max(0, x0), min(nx, x1)
-        if vz1 > vz0 and vy1 > vy0 and vx1 > vx0:
-            roi[vz0 - z0: vz0 - z0 + (vz1 - vz0),
-                vy0 - y0: vy0 - y0 + (vy1 - vy0),
-                vx0 - x0: vx0 - x0 + (vx1 - vx0)] = volume[vz0:vz1, vy0:vy1, vx0:vx1]
+            roi = np.zeros(roi_shape, dtype=np.float32)
+            vz0, vz1 = max(0, z0), min(nz, z1)
+            vy0, vy1 = max(0, y0), min(ny, y1)
+            vx0, vx1 = max(0, x0), min(nx, x1)
+            if vz1 > vz0 and vy1 > vy0 and vx1 > vx0:
+                roi[vz0 - z0: vz0 - z0 + (vz1 - vz0),
+                    vy0 - y0: vy0 - y0 + (vy1 - vy0),
+                    vx0 - x0: vx0 - x0 + (vx1 - vx0)] = volume[vz0:vz1, vy0:vy1, vx0:vx1]
 
-        roi -= float(np.percentile(roi, 5))
-        roi  = np.clip(roi, 0.0, None)
+            roi -= float(np.percentile(roi, 5))
+            roi  = np.clip(roi, 0.0, None)
 
         nz_r, ny_r, nx_r = roi.shape
         # Use the intensity peak for slicing and profiles
@@ -1987,6 +2115,170 @@ class PSFScopeGUI:
             self.status_var.set(f"CSV exported: {os.path.basename(path)}")
         except Exception as exc:
             messagebox.showerror("Export error", str(exc))
+
+    # =========================================================================
+    # FOV map PNG export
+    # =========================================================================
+
+    def _save_fov_png(self):
+        if self._bead_data is None:
+            messagebox.showwarning("No data", "Run PSF estimation first.")
+            return
+        metric = self.fov_metric.get()
+        src    = self._last_tif_path or ""
+        base   = os.path.splitext(os.path.basename(src))[0] if src else "result"
+        default_name = f"fov_{metric.lower()}_{base}.png"
+        path = filedialog.asksaveasfilename(
+            title="Save FOV map as PNG",
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.fov_fig.savefig(path, dpi=300, bbox_inches="tight")
+            self.status_var.set(f"FOV map saved → {os.path.basename(path)}")
+        except Exception as exc:
+            messagebox.showerror("Save error", str(exc))
+
+    # =========================================================================
+    # PDF report export
+    # =========================================================================
+
+    def _export_pdf(self):
+        """Generate a multi-page PDF report using matplotlib PdfPages."""
+        if self._psf is None or self._bead_data is None:
+            messagebox.showwarning("No data", "Run PSF estimation first.")
+            return
+
+        src  = self._last_tif_path or ""
+        base = os.path.splitext(os.path.basename(src))[0] if src else "result"
+        path = filedialog.asksaveasfilename(
+            title="Export PDF report",
+            initialfile=f"psfScope_report_{base}.pdf",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        from matplotlib.backends.backend_pdf import PdfPages
+        import datetime
+
+        bd  = self._bead_data
+        psf = self._psf
+        try:
+            dx = float(self.dx_var.get())
+            dz = float(self.dz_var.get())
+        except ValueError:
+            dx = dz = 1.0
+
+        with PdfPages(path) as pdf:
+            # ── Page 1: Cover ───────────────────────────────────────────────
+            fig_cover = Figure(figsize=(8.27, 11.69))   # A4
+            ax_c = fig_cover.add_axes([0.1, 0.1, 0.8, 0.8])
+            ax_c.axis("off")
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            n_acc  = bd.get('n_accepted', '?')
+            n_used = bd.get('n_used', '?')
+            n_tot  = bd.get('n_total', '?')
+
+            avg_z = bd.get('fwhm_averaged_psf_z', float('nan'))
+            avg_y = bd.get('fwhm_averaged_psf_y', float('nan'))
+            avg_x = bd.get('fwhm_averaged_psf_x', float('nan'))
+            avg_xy = 0.5 * (avg_y + avg_x) if (np.isfinite(avg_y) and np.isfinite(avg_x)) else float('nan')
+
+            lines = [
+                "psfScope — PSF Quality Report",
+                "",
+                f"Generated: {now}",
+                f"Source:    {os.path.basename(src) if src else 'N/A'}",
+                "",
+                f"dx = {dx} µm    dz = {dz} µm",
+                f"Fit mode: {self.fit_mode_var.get().upper()}",
+                "",
+                f"Beads detected:  {n_tot}",
+                f"Beads accepted:  {n_acc}",
+                f"Beads used:      {n_used}",
+                "",
+                "FWHM (averaged PSF):",
+                f"  FWHM_xy = {avg_xy:.0f} nm" if np.isfinite(avg_xy) else "  FWHM_xy = ?",
+                f"  FWHM_z  = {avg_z:.0f} nm"  if np.isfinite(avg_z)  else "  FWHM_z  = ?",
+                f"  FWHM_y  = {avg_y:.0f} nm"  if np.isfinite(avg_y)  else "  FWHM_y  = ?",
+                f"  FWHM_x  = {avg_x:.0f} nm"  if np.isfinite(avg_x)  else "  FWHM_x  = ?",
+            ]
+            ax_c.text(0.05, 0.95, "\n".join(lines),
+                      transform=ax_c.transAxes,
+                      verticalalignment='top', fontsize=11,
+                      fontfamily='monospace')
+            pdf.savefig(fig_cover, bbox_inches='tight')
+            import matplotlib.pyplot as _plt
+            _plt.close(fig_cover)
+
+            # ── Page 2: PSF cross-sections ───────────────────────────────────
+            nz, ny, nx = psf.shape
+            cz, cy, cx = nz // 2, ny // 2, nx // 2
+            fig_psf = Figure(figsize=(12, 4), tight_layout=True)
+            for i, (data, title, ext) in enumerate([
+                (psf[cz],       "XY (focal plane)", [0, nx*dx, 0, ny*dx]),
+                (psf[:, cy, :], "XZ (axial · X)",   [0, nx*dx, 0, nz*dz]),
+                (psf[:, :, cx], "YZ (axial · Y)",   [0, ny*dx, 0, nz*dz]),
+            ]):
+                ax = fig_psf.add_subplot(1, 3, i + 1)
+                ax.imshow(data, origin="lower", cmap="hot", extent=ext, aspect="auto")
+                ax.set_title(title, fontsize=9)
+            fig_psf.suptitle("PSF Cross-Sections", fontsize=11)
+            pdf.savefig(fig_psf, bbox_inches='tight')
+
+            # ── Page 3: FWHM histograms ───────────────────────────────────────
+            used     = bd.get('accepted_used', np.array([], dtype=bool))
+            sz_arr   = bd['accepted_sigma_z']
+            sxy_arr  = bd['accepted_sigma_xy']
+            acc_px_a = bd['accepted_px']
+            sz_used  = sz_arr[used]  * 2.355 * 1000 if used.any() else np.array([])
+            sxy_used = sxy_arr[used] * 2.355 * 1000 if used.any() else np.array([])
+            bead_z   = acc_px_a[used, 0] * dz       if used.any() else np.array([])
+
+            fig_h = Figure(figsize=(13, 4), tight_layout=True)
+            ax_h1 = fig_h.add_subplot(131)
+            ax_h2 = fig_h.add_subplot(132)
+            ax_h3 = fig_h.add_subplot(133)
+            if len(sxy_used):
+                ax_h1.hist(sxy_used, bins=15, color="steelblue", alpha=0.75)
+            ax_h1.set_xlabel("FWHM_xy (nm)")
+            ax_h1.set_title("FWHM_xy per bead")
+            if len(sz_used):
+                ax_h2.hist(sz_used, bins=15, color="steelblue", alpha=0.75)
+            ax_h2.set_xlabel("FWHM_z (nm)")
+            ax_h2.set_title("FWHM_z per bead")
+            if len(bead_z) and len(sxy_used):
+                ax_h3.scatter(bead_z, sxy_used, s=20, alpha=0.7, color="steelblue")
+            ax_h3.set_xlabel("Bead Z position (µm)")
+            ax_h3.set_ylabel("FWHM_xy (nm)")
+            ax_h3.set_title("FWHM_xy vs depth")
+            fig_h.suptitle("Per-bead FWHM Distributions", fontsize=11)
+            pdf.savefig(fig_h, bbox_inches='tight')
+
+            # ── Page 4: FOV map ───────────────────────────────────────────────
+            fig_fov = Figure(figsize=(7, 6), tight_layout=True)
+            ax_fov  = fig_fov.add_subplot(111)
+            if len(acc_px_a) > 0 and used.any():
+                xs_f = acc_px_a[used, 2] * dx
+                ys_f = acc_px_a[used, 1] * dx
+                vs_f = sxy_arr[used] * 2.355 * 1000
+                sc_f = ax_fov.scatter(xs_f, ys_f, c=vs_f, cmap="RdYlGn_r",
+                                      s=80, edgecolors="black", lw=0.4)
+                fig_fov.colorbar(sc_f, ax=ax_fov, label="FWHM_xy (nm)", shrink=0.85)
+            ax_fov.set_xlabel("x (µm)")
+            ax_fov.set_ylabel("y (µm)")
+            ax_fov.set_title("FOV Map — FWHM_xy")
+            ax_fov.set_aspect("equal")
+            pdf.savefig(fig_fov, bbox_inches='tight')
+
+        self.status_var.set(f"PDF report saved → {os.path.basename(path)}")
+        messagebox.showinfo("Export complete",
+                            f"PDF report saved:\n{path}")
 
     # =========================================================================
     # Log helpers

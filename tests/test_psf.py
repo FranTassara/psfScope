@@ -29,6 +29,7 @@ from postprocess_psf import (
     _filter_amplitude,
     _filter_r2,
     _filter_sanity,
+    _quality_check_3d,
 )
 
 
@@ -352,7 +353,24 @@ class TestEstimatePSF:
         assert n2b >= n3 >= 0, "n_amplitude must be <= n_fit_ok"
         assert n3 >= n4 >= 0,  "n_r2 must be <= n_amplitude"
         assert n4 >= n5 >= 0,  "n_sanity must be <= n_r2"
-        assert bd['n_used'] == n5, "n_used must equal n_sanity survivors"
+        # With default best_fraction=1.0 all sanity survivors are used
+        assert bd['n_used'] == n5, "n_used must equal n_sanity survivors (best_fraction=1.0)"
+
+
+    def test_theoretical_keys_none_when_disabled(self):
+        """When compare_theoretical=False (default) all theory keys must be None."""
+        volume, positions, sz, sxy = _make_bead_volume(n_beads=3)
+        _, _, bd = self._run(volume, positions, sz, sxy)
+
+        assert 'psf_theoretical' in bd, "Key 'psf_theoretical' must exist in bead_data"
+        assert 'psf_mse'         in bd, "Key 'psf_mse' must exist in bead_data"
+        assert 'psf_ncc'         in bd, "Key 'psf_ncc' must exist in bead_data"
+        assert 'psf_pearson_r'   in bd, "Key 'psf_pearson_r' must exist in bead_data"
+
+        assert bd['psf_theoretical'] is None, "psf_theoretical must be None when disabled"
+        assert bd['psf_mse']        is None, "psf_mse must be None when disabled"
+        assert bd['psf_ncc']        is None, "psf_ncc must be None when disabled"
+        assert bd['psf_pearson_r']  is None, "psf_pearson_r must be None when disabled"
 
 
 # =============================================================================
@@ -519,6 +537,143 @@ class TestFilterSanity:
 
 
 # =============================================================================
+# Regression tests for _quality_check_3d (Item 1)
+# =============================================================================
+
+class TestQualityCheck3D:
+    """Verify _quality_check_3d always returns an 8-tuple."""
+
+    _DX = 0.127
+    _DZ = 0.110
+    _SXY_BOUNDS = (0.05, 0.50)
+    _SZ_BOUNDS  = (0.05, 0.80)
+
+    def _check(self, roi):
+        result = _quality_check_3d(
+            roi, self._DX, self._DZ, self._SXY_BOUNDS, self._SZ_BOUNDS
+        )
+        assert len(result) == 8, (
+            f"_quality_check_3d must always return 8 values, got {len(result)}"
+        )
+        return result
+
+    def test_zero_amplitude_returns_false_8tuple(self):
+        """Uniform ROI (A0 ≈ 0) must trigger early return: (False, None×7)."""
+        roi = np.full((11, 15, 15), 500.0, dtype=np.float32)
+        ok, sz, sy, sx, off, amp, bg, r2 = self._check(roi)
+        assert ok is False
+        assert all(v is None for v in (sz, sy, sx, off, amp, bg, r2))
+
+    def test_fit_failure_returns_false_8tuple(self):
+        """A ROI that causes curve_fit to fail must still return 8 values."""
+        rng = np.random.default_rng(7)
+        # Tiny ROI → bounds conflict makes fitting ill-conditioned
+        roi = rng.normal(200, 50, (3, 5, 5)).astype(np.float32)
+        roi[1, 2, 2] = 5000.0  # A0 > 0 so we enter the fitting path
+        result = self._check(roi)
+        assert result[0] in (True, False), "First element must be bool"
+
+    def test_valid_gaussian_returns_true_8tuple(self):
+        """Clean 3-D Gaussian ROI must succeed: (True, sz>0, sy>0, sx>0, ...)."""
+        nz, ny, nx = 21, 21, 21
+        sigma_xy_px = 0.15 / self._DX
+        sigma_z_px  = 0.35 / self._DZ
+        zz, yy, xx = np.mgrid[:nz, :ny, :nx]
+        cz, cy, cx = nz // 2, ny // 2, nx // 2
+        roi = (1000.0 * np.exp(
+            -(((zz - cz) / sigma_z_px)  ** 2 +
+              ((yy - cy) / sigma_xy_px) ** 2 +
+              ((xx - cx) / sigma_xy_px) ** 2) / 2.0
+        ) + 50.0).astype(np.float32)
+
+        ok, sz, sy, sx, off, amp, bg, r2 = self._check(roi)
+        assert ok is True,   "Clean Gaussian must produce ok=True"
+        assert sz > 0,       "sz must be positive"
+        assert sy > 0,       "sy must be positive"
+        assert sx > 0,       "sx must be positive"
+        assert amp > 0,      "amplitude must be positive"
+        assert r2 > 0.9,     f"R² must be >0.9 for clean Gaussian, got {r2:.3f}"
+
+
+# =============================================================================
+# Tests for best_fraction parameter (Item 2 / Item 10)
+# =============================================================================
+
+class TestBestFraction:
+
+    def _run_bf(self, best_fraction, seed=42, n_beads=8):
+        volume, positions, sz, sxy = _make_bead_volume(n_beads=n_beads, seed=seed)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tif = os.path.join(tmpdir, "beads.tif")
+            imwrite(tif, volume)
+            _, _, bd = estimate_psf_from_beads(
+                tif_path         = tif,
+                dx               = 0.127,
+                dz               = 0.110,
+                sigma_xy_bounds  = (0.05, 0.50),
+                sigma_z_bounds   = (0.05, 0.80),
+                min_sep_um       = 2.0,
+                roi_um           = (1.5, 1.5, 1.5),
+                margin_px        = 2,
+                r2_threshold     = 0.85,
+                verbose          = False,
+                return_bead_data = True,
+                best_fraction    = best_fraction,
+            )
+        return bd
+
+    def test_n_used_reduced_by_best_fraction(self):
+        """best_fraction=0.5 must reduce n_used to at most ceil(0.5 × n_sanity)."""
+        bd = self._run_bf(best_fraction=0.5)
+        if bd['n_sanity'] < 2:
+            pytest.skip("Not enough quality beads to test best_fraction")
+        import math
+        max_allowed = math.ceil(0.5 * bd['n_sanity'])
+        assert bd['n_used'] <= max_allowed, (
+            f"n_used={bd['n_used']} > ceil(0.5 × n_sanity={bd['n_sanity']})={max_allowed}"
+        )
+
+    def test_best_fraction_one_is_noop(self):
+        """best_fraction=1.0 must give the same n_used as the default."""
+        bd_default = self._run_bf(best_fraction=1.0, seed=0)
+        bd_explicit = self._run_bf(best_fraction=1.0, seed=0)
+        assert bd_default['n_used'] == bd_explicit['n_used']
+        assert bd_default['n_used'] == bd_default['n_sanity'], (
+            "With best_fraction=1.0, n_used must equal n_sanity"
+        )
+
+    def test_best_fraction_selects_sharpest(self):
+        """Used beads (best_fraction subset) must have smaller σ_xy than excluded beads."""
+        bd = self._run_bf(best_fraction=0.5)
+        if bd['n_sanity'] < 2:
+            pytest.skip("Not enough quality beads to test selection")
+
+        used_mask     = bd['accepted_used']
+        excluded_mask = bd['accepted_not_used_best_fraction']
+
+        if not excluded_mask.any():
+            pytest.skip("No beads excluded by best_fraction in this run")
+
+        mean_used     = bd['accepted_sigma_xy'][used_mask].mean()
+        mean_excluded = bd['accepted_sigma_xy'][excluded_mask].mean()
+        assert mean_used <= mean_excluded + 1e-9, (
+            f"Used beads σ_xy ({mean_used:.4f} µm) must be ≤ excluded "
+            f"({mean_excluded:.4f} µm)"
+        )
+
+    def test_accepted_rois_cache_present(self):
+        """accepted_rois must be a non-empty list of arrays when beads are accepted."""
+        bd = self._run_bf(best_fraction=1.0)
+        assert 'accepted_rois' in bd, "bead_data must contain 'accepted_rois'"
+        if bd['n_accepted'] > 0:
+            assert isinstance(bd['accepted_rois'], list), "accepted_rois must be a list"
+            assert len(bd['accepted_rois']) == bd['n_accepted'], (
+                "len(accepted_rois) must equal n_accepted"
+            )
+            assert bd['accepted_rois'][0].ndim == 3, "Each ROI must be 3-D"
+
+
+# =============================================================================
 # Unit tests for measure_fwhm_from_averaged_psf
 # =============================================================================
 
@@ -590,6 +745,56 @@ class TestMeasureFWHMFromAveragedPSF:
         result = measure_fwhm_from_averaged_psf(psf, (110.0, 127.0, 127.0))
         for k in ['fwhm_z_nm', 'fwhm_y_nm', 'fwhm_x_nm']:
             assert not np.isfinite(result[k]), f"{k} should be nan for flat input"
+
+    def test_bead_correction_keys_present_when_nonzero_diameter(self):
+        """Corrected FWHM keys must appear when bead_diameter_nm > 0."""
+        psf = _make_gauss3d((21, 21, 21), 150.0, 100.0, 100.0, 110.0, 127.0, 127.0)
+        result = measure_fwhm_from_averaged_psf(psf, (110.0, 127.0, 127.0),
+                                                bead_diameter_nm=100.0)
+        for k in ('fwhm_z_nm_corrected', 'fwhm_y_nm_corrected', 'fwhm_x_nm_corrected'):
+            assert k in result, f"Missing corrected key '{k}'"
+
+    def test_bead_correction_keys_absent_when_zero_diameter(self):
+        """Corrected FWHM keys must NOT appear when bead_diameter_nm=0."""
+        psf = _make_gauss3d((21, 21, 21), 150.0, 100.0, 100.0, 110.0, 127.0, 127.0)
+        result = measure_fwhm_from_averaged_psf(psf, (110.0, 127.0, 127.0),
+                                                bead_diameter_nm=0.0)
+        for k in ('fwhm_z_nm_corrected', 'fwhm_y_nm_corrected', 'fwhm_x_nm_corrected'):
+            assert k not in result, f"Key '{k}' must not be present when bead_diameter_nm=0"
+
+    def test_bead_correction_formula(self):
+        """Corrected FWHM must equal sqrt(max(fwhm_measured² − d², 0))."""
+        dz_nm, dy_nm, dx_nm = 110.0, 127.0, 127.0
+        bead_d_nm = 100.0
+        psf = _make_gauss3d((61, 55, 55), 824.0 / 2.355, 353.0 / 2.355, 353.0 / 2.355,
+                            dz_nm, dy_nm, dx_nm)
+        result = measure_fwhm_from_averaged_psf(psf, (dz_nm, dy_nm, dx_nm),
+                                                bead_diameter_nm=bead_d_nm)
+        d2 = bead_d_nm ** 2
+        for axis, raw_key, corr_key in (
+            ('z', 'fwhm_z_nm', 'fwhm_z_nm_corrected'),
+            ('y', 'fwhm_y_nm', 'fwhm_y_nm_corrected'),
+            ('x', 'fwhm_x_nm', 'fwhm_x_nm_corrected'),
+        ):
+            raw = result[raw_key]
+            expected = float(np.sqrt(max(raw ** 2 - d2, 0.0)))
+            np.testing.assert_allclose(
+                result[corr_key], expected, rtol=1e-6,
+                err_msg=f"Correction formula mismatch on {axis}"
+            )
+
+    def test_bead_correction_smaller_than_measured(self):
+        """Corrected FWHM must be ≤ measured FWHM for a finite bead diameter."""
+        psf = _make_gauss3d((61, 55, 55), 824.0 / 2.355, 353.0 / 2.355, 353.0 / 2.355,
+                            110.0, 127.0, 127.0)
+        result = measure_fwhm_from_averaged_psf(psf, (110.0, 127.0, 127.0),
+                                                bead_diameter_nm=50.0)
+        for axis in ('z', 'y', 'x'):
+            raw  = result[f'fwhm_{axis}_nm']
+            corr = result[f'fwhm_{axis}_nm_corrected']
+            assert corr <= raw + 1e-9, (
+                f"Corrected FWHM ({corr:.1f} nm) must be ≤ measured ({raw:.1f} nm) on {axis}"
+            )
 
 
 # =============================================================================
