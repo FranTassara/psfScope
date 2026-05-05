@@ -86,13 +86,15 @@ data throughout the entire pipeline — from detection and ROI extraction to
 fitting — nor do they combine a spatial map of PSF variability across the
 field of view with a scriptable pure-Python core and an integrated GUI.
 
-`psfScope` complements these tools by targeting the specific needs of OPM
-users — anisotropic voxels handled natively in physical units throughout the
-entire pipeline (not only in the FWHM fit), a simultaneous 3-D Gaussian
-fitting option, depth-dependent aberration analysis, and quantitative
-voxel-wise comparison against vectorial and scalar theoretical PSFs — all
-wrapped in a scriptable pure-Python core with an integrated GUI.
-Table 1 summarises the main feature differences.
+`psfScope` complements these tools by combining, in a single open-source
+application, several capabilities that are otherwise scattered across
+different tools or absent altogether: a scriptable pure-Python core with a
+built-in interactive GUI; a depth-dependent FWHM diagnostic that exposes
+spherical-aberration gradients along the optical axis; voxel-wise comparison
+of the empirical PSF against vectorial and scalar theoretical models with MSE,
+normalised cross-correlation and Pearson similarity metrics; and
+click-to-inspect quality control on individual beads during the analysis
+itself. Table 1 summarises the main feature differences.
 
 **Table 1.** Feature comparison between `psfScope` and the most widely used
 open-source bead-based PSF tools. ✓ = supported, ✗ = not supported,
@@ -104,63 +106,70 @@ open-source bead-based PSF tools. ✓ = supported, ✗ = not supported,
 | Pure-Python install (no Java / ImageJ runtime) | ✓ | ✗ | ✓ | ✗ |
 | Scriptable programmatic API | ✓ | ✗ | ✓ | ✗ |
 | Built-in graphical user interface | ✓ | ✓ | ✗ | ✓ |
-| Anisotropic voxels (dz ≠ dx) handled in physical units throughout | ✓ | ◐¹ | ◐¹ | ◐¹ |
+| Anisotropic voxels (dz ≠ dx) handled in physical units throughout | ✓ | ◐¹ | ✓ | ◐¹ |
 | Sub-pixel-aligned averaged PSF saved as deconvolution-ready TIFF | ✓ | ✓ | ✓ | ✗ |
 | Simultaneous 3-D Gaussian fit option (in addition to 1-D per axis) | ✓ | ✗² | ✓ | ✗ |
-| Bead size deconvolution / finite-bead-size correction | ✗³ | ✓ | ✓ | ✗ |
-| Per-bead spatial map of resolution across the FOV | ✓ | ✓ | ✗ | ✗⁴ |
-| FWHM-vs-depth analysis (depth-dependent spherical aberration) | ✓ | ✗⁵ | ✗ | ✗ |
-| Per-bead lateral asymmetry / ellipticity | ✓ | ✓ | ✗ | ◐⁶ |
-| Per-bead signal-to-noise ratio | ✓ | ✗ | ✗ | ✗⁷ |
-| Interactive click-to-inspect of individual beads | ✓ | ◐⁸ | ✗ | ✗ |
-| Quantitative comparison with full 3-D theoretical PSF (MSE / NCC / r) | ✓ | ✗⁹ | ◐¹⁰ | ✗⁹ |
+| Bead size deconvolution / finite-bead-size correction | ✗³ | ✓ | ✗ | ✗ |
+| GPU acceleration (CUDA / CuPy) | ✗ | ✗ | ✓ | ✗ |
+| Best-fraction selection (rank by σ, keep sharpest subset) | ✗⁴ | ✗ | ✓ | ✗ |
+| Per-bead spatial map of resolution across the FOV | ✓ | ✓ | ◐⁵ | ✗⁶ |
+| FWHM-vs-axial-depth analysis (depth-dependent spherical aberration) | ✓ | ✗⁷ | ✗ | ✗ |
+| Per-bead lateral asymmetry / ellipticity | ✓ | ✓ | ◐⁸ | ◐⁹ |
+| Per-bead signal-to-noise ratio | ✓ | ✗ | ✗ | ✗¹⁰ |
+| Interactive click-to-inspect of individual beads | ✓ | ◐¹¹ | ✗ | ✗ |
+| Voxel-wise comparison vs full 3-D theoretical PSF (MSE / NCC / r) | ✓ | ✗¹² | ◐¹³ | ✗¹² |
 | Per-bead tabular export for downstream statistical analysis | ✓ | ✓ | ✓ | ✓ |
 | Batch processing of multiple bead volumes | ✓ | ✓ | ✓ | ✓ |
 
 **Notes.**
-¹ All three tools accept calibrated voxels in physical units so FWHM is
-fitted in µm, but bead detection, ROI extraction, and lateral fits assume
-square pixels or operate in pixel space, which is appropriate for traditional
-widefield/confocal data but does not extend to OPM volumes where the deskewed
-dz differs significantly from dx. `psfScope` formulates the DoG filter, the
-ellipsoidal NMS footprint, and the isolation filter directly in µm with
-per-axis scaling.
-² PSFj uses a 2-D elliptic Gaussian fit in the focal plane and an independent
-1-D Gaussian fit along z; no joint 3-D minimisation is performed.
-³ PSFj and `localize-psf` correct the measured FWHM for the finite diameter
-of the bead (assuming a known nominal diameter). `psfScope` currently assumes
-sub-diffraction beads; for ~200 nm beads at high NA this introduces a small
-systematic positive bias on FWHM that should be corrected in post-processing.
-⁴ MetroloJ\_QC's Batch PSF Profiler aggregates FWHMs across the FOV without
-preserving individual bead spatial coordinates, so no per-bead positional
-scatter map is generated.
-⁵ PSFj reports a z₀ (best-focus axial position) heatmap useful for diagnosing
+¹ PSFj and MetroloJ\_QC accept calibrated voxels in physical units so the
+FWHM is fitted in µm, but bead detection and lateral fitting assume dx = dy
+and operate in pixel space, which limits applicability to OPM volumes whose
+deskewed dz differs significantly from dx.
+² PSFj uses an elliptic-Gaussian 2-D fit in the focal plane plus an
+independent 1-D Gaussian fit along z; no joint 3-D minimisation is performed.
+³ `psfScope` currently assumes sub-diffraction beads. For ~200 nm beads at
+high NA this introduces a small positive bias on the recovered FWHM that can
+be removed in post-processing.
+⁴ `localize-psf` exposes the `psf_percentiles` parameter, which keeps only
+beads in the smallest σ percentile when forming the averaged PSF. `psfScope`
+reaches the final bead set through a sequence of edge, isolation, fit-quality,
+amplitude, R², and sanity filters but does not include a percentile-based
+selection step on σ.
+⁵ `localize-psf`'s `plot_bead_locations` overlays per-bead σ values onto the
+maximum-intensity projection as a weighted scatter; it does not compute an
+interpolated resolution heatmap.
+⁶ MetroloJ\_QC's Batch PSF Profiler assumes a translation-invariant PSF and
+aggregates FWHMs across the FOV without preserving individual bead spatial
+coordinates.
+⁷ PSFj reports a z₀ (best-focus axial position) heatmap useful for diagnosing
 stage tilt and field flatness, but does not plot FWHM as a function of bead
 axial depth; depth-dependent spherical aberration therefore cannot be
 diagnosed directly.
-⁶ MetroloJ\_QC reports a Lateral Asymmetry Ratio from the *averaged*
-FWHM\_x and FWHM\_y, not per individual bead.
-⁷ MetroloJ\_QC reports a Signal-to-Background ratio (bead intensity divided
+⁸ `localize-psf` provides asymmetric and rotated 3-D Gaussian models that
+recover separate σ\_x, σ\_y, σ\_z, but the symmetric model is the default
+in `autofit_psfs`.
+⁹ MetroloJ\_QC reports a Lateral Asymmetry Ratio per channel computed from
+the *averaged* FWHM\_x and FWHM\_y, not per individual bead.
+¹⁰ MetroloJ\_QC reports a Signal-to-Background ratio (bead intensity divided
 by mean intensity in a surrounding annulus), which its documentation explicitly
 distinguishes from an SNR estimate.
-⁸ PSFj's bead inspection panel allows the user to select beads and generate
-a per-bead PDF report (lateral 2-D fit, axial 1-D fit, fit residuals and
-parameters). `psfScope` instead opens a live window with ROI cross-sections
-and 1-D intensity profiles overlaid with Gaussian fits, enabling rapid visual
-quality control during analysis.
-⁹ Theoretical comparison in PSFj and MetroloJ\_QC is restricted to scalar
-Born-Wolf-style FWHM formulas; neither performs voxel-wise comparison against
-a full 3-D theoretical PSF.
-¹⁰ `localize-psf` includes Richards-Wolf-style models internally but does not
-by default report MSE, NCC, or Pearson similarity metrics against the
-empirical PSF.
+¹¹ PSFj's bead inspection panel allows the user to select beads after the
+analysis and generate a per-bead PDF report. `psfScope` instead opens a live
+window with ROI cross-sections and 1-D intensity profiles overlaid with
+Gaussian fits, enabling rapid visual quality control during the analysis.
+¹² Theoretical comparison is restricted to analytical FWHM formulas
+(Born-Wolf style) rather than voxel-wise comparison against a full 3-D
+theoretical PSF.
+¹³ `localize-psf` includes Born-Wolf, Gibson-Lanni, and vectorial PSF models
+and fits them to the empirical PSF, but does not by default report MSE,
+normalised cross-correlation, or Pearson similarity metrics.
 
-The combination of a scriptable Python core with a built-in interactive GUI,
-an anisotropic OPM-native pipeline (DoG filtering, detection footprint, and
-isolation operating in µm rather than pixels), depth-dependent aberration
-diagnostics, and quantitative comparison against vectorial and scalar
-theoretical PSFs is, to our knowledge, not provided by any other openly
-available tool.
+The combination of a pure-Python implementation with a built-in interactive
+GUI, depth-dependent aberration diagnostics, voxel-wise quantitative
+comparison against vectorial and scalar theoretical PSFs, and live
+click-to-inspect quality control during analysis is, to our knowledge, not
+provided by any other openly available tool.
 
 `psfScope` was designed to fill this gap for OPM practitioners:
 
