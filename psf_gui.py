@@ -226,7 +226,7 @@ class PSFScopeGUI:
         self.roi_x_var         = tk.StringVar(value="2.5")
 
         _PARAM_TIPS = {
-            "dx (µm):": (
+            "dxy (µm):": (
                 "Lateral (XY) pixel size in µm.\n"
                 "Typical OPM/SOLS: 0.100–0.150 µm."
             ),
@@ -249,19 +249,15 @@ class PSFScopeGUI:
                 "Extra exclusion border in pixels around the volume edge.\n"
                 "Prevents beads whose extraction ROI would be clipped."
             ),
-            "R² threshold:": (
-                "Goodness-of-fit cutoff for the Gaussian fit (0–1).\n"
-                "Beads below this value are rejected as poor fits.\n"
-                "Typical: 0.85–0.95."
-            ),
         }
+        # Row 0: voxel sizes
+        # Row 1: detection params (threshold, separation, margin)
         for lbl, var, r, c in [
-            ("dx (µm):",                  self.dx_var,          0, 0),
-            ("dz (µm):",                  self.dz_var,          0, 2),
+            ("dxy (µm):",                  self.dx_var,         0, 0),
+            ("dz (µm):",                   self.dz_var,         0, 2),
             ("Threshold (auto if empty):", self.thr_var,        1, 0),
             ("Min separation (µm):",       self.sep_var,        1, 2),
-            ("Edge margin (px):",          self.margin_px_var,  2, 0),
-            ("R² threshold:",              self.r2_thresh_var,  2, 2),
+            ("Edge margin (px):",          self.margin_px_var,  1, 4),
         ]:
             ttk.Label(pf, text=lbl).grid(row=r, column=c, sticky="w", **PAD)
             entry = ttk.Entry(pf, textvariable=var, width=10)
@@ -269,18 +265,33 @@ class PSFScopeGUI:
             if lbl in _PARAM_TIPS:
                 _Tooltip(entry, _PARAM_TIPS[lbl])
 
-        # Reporting mode: multi-select checkboxes
-        ttk.Label(pf, text="Report:").grid(row=3, column=0, sticky="w", **PAD)
-        ttk.Checkbutton(pf, text="avg-PSF",
-                        variable=self.rm_avg_var).grid(
-            row=3, column=1, sticky="w", padx=4)
-        ttk.Checkbutton(pf, text="per-bead mean±SD",
-                        variable=self.rm_mean_var).grid(
-            row=3, column=2, columnspan=2, sticky="w", padx=4)
-        ttk.Checkbutton(pf, text="per-bead median±MAD",
-                        variable=self.rm_median_var).grid(
-            row=3, column=4, columnspan=2, sticky="w", padx=4)
+        # Row 2: fit-quality / PSF-correction params
+        ttk.Label(pf, text="R² threshold:").grid(row=2, column=0, sticky="w", **PAD)
+        r2_entry = ttk.Entry(pf, textvariable=self.r2_thresh_var, width=10)
+        r2_entry.grid(row=2, column=1, sticky="w", **PAD)
+        _Tooltip(r2_entry,
+                 "Goodness-of-fit cutoff for the Gaussian fit (0–1).\n"
+                 "Beads below this value are rejected as poor fits.\n"
+                 "Typical: 0.85–0.95.")
 
+        ttk.Label(pf, text="Best fraction (σ_xy):").grid(row=2, column=2, sticky="w", **PAD)
+        bf_spin = ttk.Spinbox(pf, from_=0.1, to=1.0, increment=0.05,
+                              textvariable=self.best_fraction_var, width=8)
+        bf_spin.grid(row=2, column=3, sticky="w", **PAD)
+        _Tooltip(bf_spin,
+                 "Keep only the sharpest fraction of accepted beads for PSF averaging.\n"
+                 "1.0 = keep all (default). 0.5 = keep the 50%% with smallest σ_xy.\n"
+                 "Range 0.1–1.0, step 0.05.")
+
+        ttk.Label(pf, text="Bead diameter (nm):").grid(row=2, column=4, sticky="w", **PAD)
+        bd_entry = ttk.Entry(pf, textvariable=self.bead_diameter_var, width=8)
+        bd_entry.grid(row=2, column=5, sticky="w", **PAD)
+        _Tooltip(bd_entry,
+                 "Known fluorescent bead diameter [nm] for finite-bead-size correction.\n"
+                 "Corrected FWHM = sqrt(FWHM_measured² − d²).\n"
+                 "Typical: 100–220 nm. Set to 0 to skip (default).")
+
+        # Row 3: ROI
         _ROI_TIPS = {
             "ROI Z (µm):": (
                 "Extraction half-size along Z centred on each bead [µm].\n"
@@ -301,55 +312,44 @@ class PSFScopeGUI:
             ("ROI Y (µm):", self.roi_y_var, 2),
             ("ROI X (µm):", self.roi_x_var, 4),
         ]:
-            ttk.Label(pf, text=lbl).grid(row=4, column=c, sticky="w", **PAD)
+            ttk.Label(pf, text=lbl).grid(row=3, column=c, sticky="w", **PAD)
             roi_entry = ttk.Entry(pf, textvariable=var, width=10)
-            roi_entry.grid(row=4, column=c+1, sticky="w", **PAD)
+            roi_entry.grid(row=3, column=c+1, sticky="w", **PAD)
             if lbl in _ROI_TIPS:
                 _Tooltip(roi_entry, _ROI_TIPS[lbl])
 
         ttk.Label(pf,
                   text="ROI: extraction window around each bead. "
                        "Reduce ROI Z (e.g. 1.2) for thin volumes.",
-                  foreground="gray").grid(row=5, column=0, columnspan=6, sticky="w", padx=8)
+                  foreground="gray").grid(row=4, column=0, columnspan=6, sticky="w", padx=8)
 
-        # Best-fraction and bead-diameter row
-        bf_lbl = ttk.Label(pf, text="Best fraction (σ_xy):")
-        bf_lbl.grid(row=6, column=0, sticky="w", **PAD)
-        bf_spin = ttk.Spinbox(pf, from_=0.1, to=1.0, increment=0.05,
-                              textvariable=self.best_fraction_var, width=8)
-        bf_spin.grid(row=6, column=1, sticky="w", **PAD)
-        _Tooltip(bf_spin,
-                 "Keep only the sharpest fraction of accepted beads for PSF averaging.\n"
-                 "1.0 = keep all (default). 0.5 = keep the 50%% with smallest σ_xy.\n"
-                 "Range 0.1–1.0, step 0.05.")
-
-        bd_lbl = ttk.Label(pf, text="Bead diameter (nm):")
-        bd_lbl.grid(row=6, column=2, sticky="w", **PAD)
-        bd_entry = ttk.Entry(pf, textvariable=self.bead_diameter_var, width=8)
-        bd_entry.grid(row=6, column=3, sticky="w", **PAD)
-        ttk.Label(pf, text="0 = no correction", foreground="gray").grid(
-            row=6, column=4, sticky="w", padx=4)
-        _Tooltip(bd_entry,
-                 "Known fluorescent bead diameter [nm] for finite-bead-size correction.\n"
-                 "Corrected FWHM = sqrt(FWHM_measured² − d²).\n"
-                 "Typical values: 100–220 nm. Set to 0 to skip (default).")
-
-        # Fitting mode
-        fit_lbl = ttk.Label(pf, text="Fitting mode:")
-        fit_lbl.grid(row=7, column=0, sticky="w", **PAD)
+        # Row 5: Fitting mode
+        ttk.Label(pf, text="Fitting mode:").grid(row=5, column=0, sticky="w", **PAD)
 
         self.fit_mode_var = tk.StringVar(value="1d")
         ttk.Radiobutton(pf, text="1D sequential  (fast)",
                         variable=self.fit_mode_var, value="1d").grid(
-            row=7, column=1, columnspan=2, sticky="w", padx=4)
+            row=5, column=1, columnspan=2, sticky="w", padx=4)
         ttk.Radiobutton(pf, text="3D simultaneous  (accurate, slower)",
                         variable=self.fit_mode_var, value="3d").grid(
-            row=7, column=3, columnspan=3, sticky="w", padx=4)
+            row=5, column=3, columnspan=3, sticky="w", padx=4)
 
         ttk.Label(pf,
                   text="3D fits a full Gaussian to the ROI volume — more accurate for "
                        "asymmetric PSFs but ~10–100× slower per bead.",
-                  foreground="gray").grid(row=8, column=0, columnspan=6, sticky="w", padx=8)
+                  foreground="gray").grid(row=6, column=0, columnspan=6, sticky="w", padx=8)
+
+        # Row 7: Reporting mode
+        ttk.Label(pf, text="Report:").grid(row=7, column=0, sticky="w", **PAD)
+        ttk.Checkbutton(pf, text="avg-PSF",
+                        variable=self.rm_avg_var).grid(
+            row=7, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(pf, text="per-bead mean±SD",
+                        variable=self.rm_mean_var).grid(
+            row=7, column=2, columnspan=2, sticky="w", padx=4)
+        ttk.Checkbutton(pf, text="per-bead median±MAD",
+                        variable=self.rm_median_var).grid(
+            row=7, column=4, columnspan=2, sticky="w", padx=4)
 
         # --- Theoretical PSF (optional) ---
         tf = ttk.LabelFrame(param_row, text="Theoretical PSF (optional)")
