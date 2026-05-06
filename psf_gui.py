@@ -1696,6 +1696,25 @@ class PSFScopeGUI:
                 sc, ax=self.fov_ax, label=cbar_label, shrink=0.85
             )
 
+            # Theoretical FWHM reference line on the colorbar
+            theory = self._get_theory_fwhm()
+            if theory is not None and metric in ("FWHM_xy", "FWHM_y", "FWHM_x", "FWHM_z"):
+                theory_val = theory[1] if metric == "FWHM_z" else theory[0]
+                cax = self._fov_cbar.ax
+                if vmin_c <= theory_val <= vmax_c:
+                    cax.axhline(theory_val, color="darkorange", lw=1.6, ls="--")
+                    cax.text(
+                        1.6, theory_val, f"theory\n{theory_val:.0f} nm",
+                        transform=cax.get_yaxis_transform(),
+                        ha="left", va="center", fontsize=7, color="darkorange",
+                    )
+                else:
+                    cax.text(
+                        0.5, -0.08, f"theory: {theory_val:.0f} nm (out of range)",
+                        transform=cax.transAxes,
+                        ha="center", va="top", fontsize=7, color="darkorange",
+                    )
+
             # Annotate global minimum and maximum
             if len(vs) > 1:
                 i_min, i_max = np.argmin(vs), np.argmax(vs)
@@ -1784,6 +1803,7 @@ class PSFScopeGUI:
             self._update_psf_plot()
         if self._bead_data is not None:
             self._update_beads_plot()
+            self._refresh_fov()
 
     # =========================================================================
     # Click-to-inspect
