@@ -225,6 +225,36 @@ class PSFScopeGUI:
         self.roi_y_var         = tk.StringVar(value="2.5")
         self.roi_x_var         = tk.StringVar(value="2.5")
 
+        _PARAM_TIPS = {
+            "dx (µm):": (
+                "Lateral (XY) pixel size in µm.\n"
+                "Typical OPM/SOLS: 0.100–0.150 µm."
+            ),
+            "dz (µm):": (
+                "Axial voxel size (deskewed) in µm.\n"
+                "For OPM: dz = galvo_step × sin(tilt°)\n"
+                "Default: 0.168 µm × sin(41°) ≈ 0.110 µm."
+            ),
+            "Threshold (auto if empty):": (
+                "DoG blob-detection threshold.\n"
+                "Leave empty or type 'auto' for automatic (mean + 5 × std).\n"
+                "Lower values detect dimmer beads; higher values reduce false positives."
+            ),
+            "Min separation (µm):": (
+                "Minimum centre-to-centre distance between accepted beads [µm].\n"
+                "Bead pairs closer than this are both excluded.\n"
+                "Typical: 2–4 µm."
+            ),
+            "Edge margin (px):": (
+                "Extra exclusion border in pixels around the volume edge.\n"
+                "Prevents beads whose extraction ROI would be clipped."
+            ),
+            "R² threshold:": (
+                "Goodness-of-fit cutoff for the Gaussian fit (0–1).\n"
+                "Beads below this value are rejected as poor fits.\n"
+                "Typical: 0.85–0.95."
+            ),
+        }
         for lbl, var, r, c in [
             ("dx (µm):",                  self.dx_var,          0, 0),
             ("dz (µm):",                  self.dz_var,          0, 2),
@@ -233,8 +263,11 @@ class PSFScopeGUI:
             ("Edge margin (px):",          self.margin_px_var,  2, 0),
             ("R² threshold:",              self.r2_thresh_var,  2, 2),
         ]:
-            ttk.Label(pf, text=lbl).grid(row=r, column=c,   sticky="w", **PAD)
-            ttk.Entry(pf, textvariable=var, width=10).grid(row=r, column=c+1, sticky="w", **PAD)
+            ttk.Label(pf, text=lbl).grid(row=r, column=c, sticky="w", **PAD)
+            entry = ttk.Entry(pf, textvariable=var, width=10)
+            entry.grid(row=r, column=c+1, sticky="w", **PAD)
+            if lbl in _PARAM_TIPS:
+                _Tooltip(entry, _PARAM_TIPS[lbl])
 
         # Reporting mode: multi-select checkboxes
         ttk.Label(pf, text="Report:").grid(row=3, column=0, sticky="w", **PAD)
@@ -248,13 +281,31 @@ class PSFScopeGUI:
                         variable=self.rm_median_var).grid(
             row=3, column=4, columnspan=2, sticky="w", padx=4)
 
+        _ROI_TIPS = {
+            "ROI Z (µm):": (
+                "Extraction half-size along Z centred on each bead [µm].\n"
+                "Must exceed ~2× the expected FWHM_z.\n"
+                "Reduce for thin volumes to avoid clipping (e.g. 1.2 µm)."
+            ),
+            "ROI Y (µm):": (
+                "Extraction half-size along Y centred on each bead [µm].\n"
+                "Must exceed ~2× the expected FWHM_y."
+            ),
+            "ROI X (µm):": (
+                "Extraction half-size along X centred on each bead [µm].\n"
+                "Must exceed ~2× the expected FWHM_x."
+            ),
+        }
         for lbl, var, c in [
             ("ROI Z (µm):", self.roi_z_var, 0),
             ("ROI Y (µm):", self.roi_y_var, 2),
             ("ROI X (µm):", self.roi_x_var, 4),
         ]:
-            ttk.Label(pf, text=lbl).grid(row=4, column=c,   sticky="w", **PAD)
-            ttk.Entry(pf, textvariable=var, width=10).grid(row=4, column=c+1, sticky="w", **PAD)
+            ttk.Label(pf, text=lbl).grid(row=4, column=c, sticky="w", **PAD)
+            roi_entry = ttk.Entry(pf, textvariable=var, width=10)
+            roi_entry.grid(row=4, column=c+1, sticky="w", **PAD)
+            if lbl in _ROI_TIPS:
+                _Tooltip(roi_entry, _ROI_TIPS[lbl])
 
         ttk.Label(pf,
                   text="ROI: extraction window around each bead. "
@@ -323,10 +374,6 @@ class PSFScopeGUI:
                         variable=self.show_theory_var,
                         command=self._refresh_theory_overlay).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=8, pady=4)
-
-        # Tooltips on the existing parameter fields
-        _Tooltip(pf.grid_slaves(row=0, column=1)[0] if pf.grid_slaves(row=0, column=1) else pf,
-                 "Lateral (XY) pixel size in µm.\nTypical OPM: 0.100–0.150 µm.")
 
         # --- Run button + progress bar ---
         ctrl = ttk.Frame(parent)

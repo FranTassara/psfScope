@@ -7,16 +7,23 @@ It estimates the system PSF directly from three-dimensional images of sub-diffra
 ## Features
 
 - Automated bead detection with an anisotropic ellipsoidal footprint (handles dz ≠ dx without resampling)
-- Quality filtering via **1-D sequential** or **simultaneous 3-D Gaussian fitting**
+- Fast isolation filtering via `scipy.spatial.cKDTree` (>60× faster than exhaustive pairwise search)
+- Quality filtering via **1-D sequential** or **simultaneous 3-D Gaussian fitting** with analytical Jacobian
+- **Best-fraction selection**: keep only the sharpest N% of accepted beads for PSF averaging (`best_fraction`)
+- **Finite-bead-size correction**: deconvolve the known bead diameter from measured FWHM (`bead_diameter_nm`)
 - Per-bead metrics: FWHM (Z, Y, X, XY), lateral ellipticity (σ_x − σ_y) / σ_xy, and SNR
 - Sub-pixel alignment with NaN-masked averaging
-- **Four-tab GUI** built on Python's standard `tkinter`:
-  - **Estimation** — parameters, fitting mode, theoretical PSF panel, progress log
+- **Five-tab GUI** built on Python's standard `tkinter`:
+  - **Estimation** — parameters, fitting mode, theoretical PSF panel, progress log, PDF export
   - **PSF** — XY/XZ/YZ cross-sections with measured and theoretical FWHM readout
-  - **Beads** — spatial scatter, FWHM histograms, FWHM vs depth plot, click-to-inspect viewer
-  - **FOV Map** — spatial map of FWHM / ellipticity / SNR across the field of view
+  - **Beads** — spatial scatter, FWHM histograms, FWHM vs depth, click-to-inspect bead viewer
+  - **FOV Map** — spatial map of FWHM / ellipticity / SNR with percentile colour scaling and PNG export
+  - **Histogram Fit** — diagnostic Gaussian fit to per-bead FWHM distribution
+- **PDF report export** (cover page, PSF cross-sections, FWHM histograms, FOV map)
 - CSV export of all per-bead measurements
 - Born-Wolf theoretical PSF overlay (FWHM_xy = 0.51·λ/NA, FWHM_z = 0.887·λ/(n−√(n²−NA²)))
+- Batch mode: process multiple TIFFs and merge results into a combined analysis
+- Parallel processing with `--n-jobs` (CLI) / worker threads (GUI)
 
 ## Installation
 
@@ -60,11 +67,55 @@ psf, psf_path, bead_data = estimate_psf_from_beads(
     tif_path         = "beads_deskew_488.tif",
     dx               = 0.127,   # lateral pixel size [µm]
     dz               = 0.110,   # axial voxel size, deskewed [µm]
+    best_fraction    = 0.7,     # use only the sharpest 70% of beads
+    bead_diameter_nm = 100.0,   # correct for 100 nm bead diameter
     return_bead_data = True,
 )
 ```
 
-`bead_data` is a dictionary with per-bead positions, fitted sigmas, FWHM values, ellipticity, SNR, and selection masks. See the docstring of `estimate_psf_from_beads` for the full key reference.
+`bead_data` is a dictionary with per-bead positions, fitted sigmas, FWHM values (raw and bead-size corrected), ellipticity, SNR, and selection masks. See the docstring of `estimate_psf_from_beads` for the full key reference.
+
+Key `bead_data` entries:
+
+| Key | Description |
+|-----|-------------|
+| `accepted_px` | (N, 3) pixel positions of all quality-filtered beads |
+| `accepted_sigma_{z,y,x}` | Fitted Gaussian σ in µm |
+| `accepted_fwhm_corrected_{z,y,x}` | Bead-size corrected FWHM in nm (when `bead_diameter_nm > 0`) |
+| `accepted_used` | Boolean mask — True for beads used in PSF averaging |
+| `accepted_not_used_best_fraction` | Boolean mask — True for beads excluded by `best_fraction` |
+| `accepted_rois` | Cached 3-D ROI arrays (avoids re-reading the TIFF on click-to-inspect) |
+| `fwhm_axes` | Dict with `axis_{z,y,x}` sub-dicts containing all FWHM estimators |
+| `n_total / n_edge / n_isolation / n_fit_ok / n_accepted / n_used` | Filter-funnel counts |
+
+### FWHM measurement from an averaged PSF
+
+```python
+from postprocess_psf import measure_fwhm_from_averaged_psf
+
+result = measure_fwhm_from_averaged_psf(
+    psf_3d           = psf,
+    voxel_size_nm    = (110.0, 127.0, 127.0),  # (dz, dy, dx) in nm
+    bead_diameter_nm = 100.0,
+)
+# result keys: fwhm_z_nm, fwhm_y_nm, fwhm_x_nm
+#              fwhm_z_nm_corrected, fwhm_y_nm_corrected, fwhm_x_nm_corrected
+```
+
+### CLI
+
+```bash
+psfscope beads_deskew.tif \
+    --dx 0.127 --dz 0.110 \
+    --best-fraction 0.7 \
+    --bead-diameter 100
+```
+
+Full option list:
+
+```
+psfscope --help
+```
 
 ### Generate synthetic test data
 
@@ -88,6 +139,8 @@ Default system parameters (0.168 µm step, 41° tilt): dz ≈ 0.110 µm.
 ```bash
 pytest tests/
 ```
+
+The test suite contains 46 tests covering PSF normalisation, bead detection, filter-funnel counts, Gaussian fitting accuracy, `best_fraction` selection, bead-size correction formula, and `_quality_check_3d` early-return regression.
 
 ## Citation
 
