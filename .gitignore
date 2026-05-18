@@ -30,6 +30,7 @@ Thumbs.db
 # Test TIFFs generated locally (not part of source)
 test_beads.tif
 *_psf.tif
+test_volume/
 
 # Personal notes
 Mejoras.txt
